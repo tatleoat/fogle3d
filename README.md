@@ -5,6 +5,12 @@
 > ships none of that product's files, assets or code: no program, library, database, resource, shader, font, picture
 > or texture of it is in this repository or in the add-on's zip. See [NOTICE.md](NOTICE.md).
 
+> **Vibe-coded.** Fogle3D is a vibe-coded project: it was written almost entirely by AI coding agents (Claude, by
+> Anthropic), directed by its owner, who is not a professional programmer. People did not read or review most of the
+> code line by line. It is checked by automated tests and by comparing its pictures with the original program's
+> pictures, not by human code review, and it may contain mistakes, rough edges and unfinished parts. Use it at your
+> own risk, and please report problems as issues.
+
 Fogle3D is a render engine for Blender. Its renderer is a reimplementation, in Rust, of the renderer of Softimage 3D
 4.0 (the Linux version of the program), written to give the same pictures. The Blender add-on renders the open
 Blender scene with it (Render Properties > Render Engine > Fogle3D) and imports Softimage 3D scene files

@@ -43,3 +43,7 @@ the add-on's zip contain their code):
 | `zmij` | MIT |
 
 The programs link the Rust standard library (MIT OR Apache-2.0), which is part of the Rust toolchain.
+
+## How it was made
+
+Fogle3D is vibe-coded: written almost entirely by AI coding agents (Claude, by Anthropic) under the owner's direction, with automated tests and picture comparisons instead of line-by-line human review. See the README.

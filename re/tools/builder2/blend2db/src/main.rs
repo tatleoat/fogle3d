@@ -16,9 +16,11 @@ mod roundtrip;
 mod dump;
 mod construct;
 mod fit;
+mod gloss;
 mod anim;
 mod simat;
 mod shapes;
+mod soft;
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();

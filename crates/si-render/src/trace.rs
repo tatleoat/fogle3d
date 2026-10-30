@@ -6,6 +6,7 @@
 //! `si_sTrace`. `shadowMap` (the textures of a transparent occluder) is described in the
 //! finding and comes in as an argument.
 
+use crate::pool::Pool;
 use crate::render::intersect;
 use crate::shade::{set_material_from_vertex_color, ShadeState};
 use crate::types::{RVertex, Ray, Tn, Vector};
@@ -45,11 +46,12 @@ pub struct Link {
     pub next: Option<usize>,
 }
 
-/// The tree and what hangs off it.
+/// The tree and what hangs off it. The nodes and links are [`Pool`]s: built once per frame and
+/// shared by the band threads' copies (unit blurmem1).
 #[derive(Clone, Debug, Default)]
 pub struct Bsp {
-    pub nodes: Vec<Tree>,
-    pub links: Vec<Link>,
+    pub nodes: Pool<Tree>,
+    pub links: Pool<Link>,
     /// 0x08790928: the root.
     pub root: usize,
     /// 0x0879092c: the node that stands for everything outside the scene's box; reaching it
@@ -265,6 +267,151 @@ pub fn s_trace(
     light: usize,
     shadow_map: &mut dyn FnMut(&mut ShadeState, &mut Ray, usize, Vector),
 ) -> [f32; 4] {
+    s_trace_marked(bsp, mailbox, &mut MetMarks::InTriangles, st, ray, from, distance, light, shadow_map)
+}
+
+/// Where `si_sTrace` keeps its "met" marks (flag 0x0800 of a triangle).
+///
+/// The original sets them in the triangles' flag words. They are read only by the walk
+/// itself, and only in the cell being searched, whose triangles all had their mark cleared
+/// on entering it: what a mark tells is "hit by this ray in this cell". A band thread
+/// ([`crate::bands`]) shares the triangle pool with the others and must not write it, so its
+/// walk keeps the marks in a scratch of its own instead ([`MetMarks::Scratch`]): every mark
+/// is dropped on entering a cell (the original clears only those of the cell's triangles; the
+/// others are not read before they are cleared, on entering a cell that lists them), and the
+/// flag words are left as they were. The walk's tests and results are the same; only the flag
+/// words after the frame differ, which nothing reads (the next `SI_update` makes new
+/// triangles). The flags the walk reads after a hit (0x0002, 0x0100 to 0x0400) are not the
+/// mark's bit. (Not the original's: the scratch is the port's.)
+#[derive(Clone, Debug, Default)]
+pub enum MetMarks {
+    /// In the triangles' flag words, as the original.
+    #[default]
+    InTriangles,
+    /// In a bit set by triangle index, with the indices marked since it was last cleared.
+    Scratch { bits: Vec<u64>, marked: Vec<usize> },
+}
+
+impl MetMarks {
+    pub fn scratch() -> MetMarks {
+        MetMarks::Scratch { bits: Vec::new(), marked: Vec::new() }
+    }
+
+    /// Entering the cell whose list starts at `head`: the marks of its triangles are cleared.
+    fn enter_cell(&mut self, st: &mut ShadeState, bsp: &Bsp, head: Option<usize>) {
+        match self {
+            MetMarks::InTriangles => {
+                // one write access to the pool for the whole list (each `DerefMut` checks the sharing)
+                let tns = &mut *st.tns;
+                let mut cur = head;
+                while let Some(l) = cur {
+                    tns[bsp.links[l].tn].flags &= !TN_MET;
+                    cur = bsp.links[l].next;
+                }
+            }
+            MetMarks::Scratch { bits, marked } => {
+                for t in marked.drain(..) {
+                    bits[t >> 6] &= !(1u64 << (t & 63));
+                }
+            }
+        }
+    }
+
+    /// Whether triangle `tn` is void (0x8000) or met (0x0800): it is then not tested.
+    #[inline]
+    fn skipped(&self, st: &ShadeState, tn: usize) -> bool {
+        match self {
+            MetMarks::InTriangles => st.tns[tn].flags & (0x8000 | TN_MET) != 0,
+            MetMarks::Scratch { bits, .. } => st.tns[tn].flags & 0x8000 != 0 || bits.get(tn >> 6).is_some_and(|w| w & (1u64 << (tn & 63)) != 0),
+        }
+    }
+
+    /// Marks triangle `tn` as met.
+    fn mark(&mut self, st: &mut ShadeState, tn: usize) {
+        match self {
+            MetMarks::InTriangles => st.tns[tn].flags |= TN_MET,
+            MetMarks::Scratch { bits, marked } => {
+                if bits.len() <= tn >> 6 {
+                    bits.resize(st.tns.len().max(tn + 1).div_ceil(64), 0);
+                }
+                if bits[tn >> 6] & (1u64 << (tn & 63)) == 0 {
+                    bits[tn >> 6] |= 1u64 << (tn & 63);
+                    marked.push(tn);
+                }
+            }
+        }
+    }
+}
+
+/// One triangle of a cell's list that the shadow walk's search could find: its index and
+/// what [`intersect`] stores for it ([`s_trace_marked`], "replay").
+#[derive(Clone, Copy, Debug)]
+struct Candidate {
+    tn: usize,
+    hit: crate::render::Hit,
+}
+
+thread_local! {
+    /// The candidate list of the cell being searched, kept between rays so that it is not
+    /// allocated again (ours).
+    static CANDIDATES: std::cell::Cell<Vec<Candidate>> = const { std::cell::Cell::new(Vec::new()) };
+}
+
+/// [`s_trace`] with the "met" marks kept as `met` says ([`MetMarks`]).
+///
+/// **Replay** (ours, not the original's; the result is the same to the bit). The original
+/// searches a cell's whole list again after each transparent occluder it passes there, and a
+/// motion-blurred object is k transparent copies of itself (k grows with the picture's width),
+/// so a shadow ray through the copies tests the cell's list up to 2k times. Here the list is
+/// tested once on entering the cell: every triangle the search could ever find in this cell
+/// is kept, in list order, with what [`intersect`] would store for it ([`crate::render::probe`]
+/// with the ray's distance at the cell's exit and the `tmin` of that moment, no `exclude`).
+/// Each search of the cell then goes through that list alone and makes the original's
+/// remaining tests on it in the same order: the triangle is not `from`, not void or met (read
+/// at that moment), and its distance `t` (the register value) is below the ray's present
+/// distance and not below `tmin`. Why nothing changes: on a given ray the plane, the distance
+/// and the inside test of a triangle depend only on the ray's origin and direction and on the
+/// triangle, none of which the walk changes inside a cell (it writes the ray's distance, hit
+/// and triangle, the triangles' met marks, and the materials' work colours); every search of
+/// the cell starts at the cell's exit distance and finds hits only below it; `tmin` never
+/// decreases (it becomes float(float(t) + 0.0001) of a hit not below the old one); a triangle
+/// left out because it was void stays void (nothing writes that bit while sampling). The one
+/// case outside this argument is a NaN: a NaN distance hits whatever the limits, and a NaN
+/// ray distance lets everything after it hit; when the cell's exit distance, `tmin` or a kept
+/// triangle's distance is a NaN, the cell is searched the original's way.
+#[allow(clippy::too_many_arguments)]
+pub fn s_trace_marked(
+    bsp: &mut Bsp,
+    mailbox: &mut Mailbox,
+    met: &mut MetMarks,
+    st: &mut ShadeState,
+    ray: &mut Ray,
+    from: usize,
+    distance: f32,
+    light: usize,
+    shadow_map: &mut dyn FnMut(&mut ShadeState, &mut Ray, usize, Vector),
+) -> [f32; 4] {
+    // the buffer is taken out for the walk, so that a nested walk (none is known) would start one of its own
+    let mut cands = CANDIDATES.take();
+    let r = s_trace_walk(bsp, mailbox, met, &mut cands, st, ray, from, distance, light, shadow_map);
+    CANDIDATES.set(cands);
+    r
+}
+
+/// The body of [`s_trace_marked`] (the walk of the original's `si_sTrace`), with the candidate buffer.
+#[allow(clippy::too_many_arguments)]
+fn s_trace_walk(
+    bsp: &mut Bsp,
+    mailbox: &mut Mailbox,
+    met: &mut MetMarks,
+    cands: &mut Vec<Candidate>,
+    st: &mut ShadeState,
+    ray: &mut Ray,
+    from: usize,
+    distance: f32,
+    light: usize,
+    shadow_map: &mut dyn FnMut(&mut ShadeState, &mut Ray, usize, Vector),
+) -> [f32; 4] {
     let mut tmin = SHADOW_TMIN;
     let mut from = from;
     let mut passed = false;
@@ -287,27 +434,18 @@ pub fn s_trace(
         }
         let cell_limit = fmov(ray.t);
         let head = bsp.nodes[ray.w38 as usize].list;
-        let mut cur = head;
-        while let Some(l) = cur {
-            st.tns[bsp.links[l].tn].flags &= !TN_MET;
-            cur = bsp.links[l].next;
-        }
+        met.enter_cell(st, bsp, head);
+        // the replay's candidates (see the doc comment); None: the original's search
+        let replay = collect(cands, bsp, st, ray, head, cell_limit, tmin);
         loop {
             ray.t = cell_limit;
             let limit = if x(distance).gt(x(cell_limit)) { cell_limit } else { distance };
-            let mut cur = head;
-            while let Some(l) = cur {
-                let link = &bsp.links[l];
-                cur = link.next;
-                if st.tns[link.tn].flags & (0x8000 | TN_MET) == 0 {
-                    intersect(ray, &st.tns, &st.verts, link.tn, Some(from), tmin);
-                }
-            }
+            search_cell(ray, st, bsp, met, head, from, tmin, replay.then_some(&cands[..]));
             if x(limit).lt(x(ray.t)) || x(limit).eq(x(ray.t)) {
                 break;
             }
             let hit = ray.tn.expect("si_sTrace: the ray names no triangle");
-            st.tns[hit].flags |= TN_MET;
+            met.mark(st, hit);
             let flags = st.tns[hit].flags;
             let lt = &st.lights[light];
             if lt.selective != 0 && lt.select_table[st.tns[hit].w58 as usize] != lt.select_id {
@@ -386,6 +524,62 @@ pub fn s_trace(
         }
     }
     [left[0], left[1], left[2], st.glb.unset]
+}
+
+/// One search of the cell list at `head` for the shadow walk: every triangle not void or met
+/// is tested with [`intersect`] (excluding `from`, from `tmin`), in list order; with `replay`,
+/// only the candidates [`collect`] kept are, with the remaining tests of [`intersect`] (the
+/// same result, see [`s_trace_marked`]).
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn search_cell(ray: &mut Ray, st: &ShadeState, bsp: &Bsp, met: &MetMarks, head: Option<usize>, from: usize, tmin: f32, replay: Option<&[Candidate]>) {
+    if let Some(cands) = replay {
+        for c in cands {
+            if c.tn == from || met.skipped(st, c.tn) || c.hit.t.ge(x(ray.t)) || c.hit.t.lt(x(tmin)) {
+                continue;
+            }
+            ray.t = c.hit.tf;
+            ray.hit = c.hit.hit;
+            ray.tn = Some(c.tn);
+        }
+    } else {
+        let mut cur = head;
+        while let Some(l) = cur {
+            let link = &bsp.links[l];
+            cur = link.next;
+            if !met.skipped(st, link.tn) {
+                intersect(ray, &st.tns, &st.verts, link.tn, Some(from), tmin);
+            }
+        }
+    }
+}
+
+/// Fills `cands` with the triangles of the cell list at `head` that [`intersect`] would store
+/// for `ray` with its distance at `cell_limit` and with `tmin`, in list order, void triangles
+/// left out ([`s_trace_marked`], "replay"; ours). False (and the list is not to be used) when
+/// `cell_limit`, `tmin` or a kept distance is a NaN.
+fn collect(cands: &mut Vec<Candidate>, bsp: &Bsp, st: &ShadeState, ray: &Ray, head: Option<usize>, cell_limit: f32, tmin: f32) -> bool {
+    cands.clear();
+    if cell_limit.is_nan() || tmin.is_nan() {
+        return false;
+    }
+    let probe_ray = Ray { t: cell_limit, ..*ray };
+    let (tns, verts) = (&st.tns[..], &st.verts[..]);
+    let mut cur = head;
+    while let Some(l) = cur {
+        let link = &bsp.links[l];
+        cur = link.next;
+        if tns[link.tn].flags & 0x8000 != 0 {
+            continue;
+        }
+        if let Some(hit) = crate::render::probe(&probe_ray, tns, verts, link.tn, tmin) {
+            if hit.t.is_nan() {
+                return false;
+            }
+            cands.push(Candidate { tn: link.tn, hit });
+        }
+    }
+    true
 }
 
 /// The ray counter behind the mailboxes, the file-scope `mailboxCurrent`: each traced ray
@@ -477,8 +671,9 @@ mod tests {
                 Tree { kind: 0, level: 0, ..Tree::default() },
                 wall(-10.0),
                 wall(10.0),
-            ],
-            links: vec![Link { tn: 0, ..Link::default() }],
+            ]
+            .into(),
+            links: vec![Link { tn: 0, ..Link::default() }].into(),
             root: 0,
             outside: Some(3),
         }
@@ -543,6 +738,148 @@ mod tests {
         m.current = i32::MAX;
         m.get_new_id();
         assert!(m.check_for_overflow());
+    }
+
+    /// One cell searched the way the shadow walk does (search, mark, exclude the hit, raise
+    /// `tmin`, search again) until nothing is found below the limit: every search's result
+    /// as bits. `mode` 0: the original's search of the whole list; 1: the replay; 2 and 3:
+    /// two wrong replays (the mutation switch): 2 compares float(t) instead of the register's
+    /// t, 3 keeps only what the first search would find.
+    fn cell_walk(st: &mut ShadeState, bsp: &Bsp, ray0: Ray, cell_limit: f32, distance: f32, from0: usize, tmin0: f32, mode: u8) -> Vec<(u32, [u32; 3], Option<usize>)> {
+        let (mut ray, mut from, mut tmin) = (ray0, from0, tmin0);
+        let mut met = MetMarks::scratch();
+        let head = bsp.nodes[0].list;
+        met.enter_cell(st, bsp, head);
+        let mut cands = Vec::new();
+        let replay = mode != 0 && collect(&mut cands, bsp, st, &ray, head, cell_limit, tmin);
+        if replay && mode == 3 {
+            let mut first = ray;
+            first.t = cell_limit;
+            search_cell(&mut first, st, bsp, &met, head, from, tmin, None);
+            cands.retain(|c| Some(c.tn) == first.tn);
+        }
+        let mut out = Vec::new();
+        for _ in 0..600 {
+            ray.t = cell_limit;
+            let limit = if x(distance).gt(x(cell_limit)) { cell_limit } else { distance };
+            if replay && mode == 2 {
+                for c in &cands {
+                    if c.tn == from || met.skipped(st, c.tn) || x(c.hit.tf).ge(x(ray.t)) || x(c.hit.tf).lt(x(tmin)) {
+                        continue;
+                    }
+                    (ray.t, ray.hit, ray.tn) = (c.hit.tf, c.hit.hit, Some(c.tn));
+                }
+            } else {
+                search_cell(&mut ray, st, bsp, &met, head, from, tmin, replay.then_some(&cands[..]));
+            }
+            out.push((ray.t.to_bits(), [ray.hit.x.to_bits(), ray.hit.y.to_bits(), ray.hit.z.to_bits()], ray.tn));
+            if x(limit).lt(x(ray.t)) || x(limit).eq(x(ray.t)) {
+                break;
+            }
+            let Some(hit) = ray.tn else { break };
+            met.mark(st, hit);
+            tmin = (x(ray.t) + SHADOW_PAST).to_f32();
+            from = hit;
+        }
+        out
+    }
+
+    /// A cell full of copies of one triangle moved a little along a line (as motion blur
+    /// makes them), some coinciding or a float step apart, a few void (some without corners,
+    /// which must never be tested), a few listed twice, and now and then a NaN or infinity in
+    /// a plane, the ray or the limits; a ray through them.
+    fn blur_cell(r: &mut si_x87::x87::testing::Rng) -> (ShadeState, Bsp, Ray, f32, f32, usize, f32) {
+        let mut unit = || (r.next() >> 11) as f64 / (1u64 << 53) as f64;
+        let mut vals = Vec::with_capacity(4096);
+        for _ in 0..4096 {
+            vals.push(unit());
+        }
+        let mut it = vals.into_iter();
+        let mut u = move || it.next().unwrap_or(0.5);
+        let scale = 2f32.powi((u() * 12.0) as i32 - 6);
+        let pt = |u: &mut dyn FnMut() -> f64| Vector::new((u() * 2.0 - 1.0) as f32 * scale, (u() * 2.0 - 1.0) as f32 * scale, (u() * 2.0 - 1.0) as f32 * scale);
+        let (b0, b1, b2) = (pt(&mut u), pt(&mut u), pt(&mut u));
+        let mv = pt(&mut u);
+        let sub = |a: Vector, b: Vector| Vector::new(a.x - b.x, a.y - b.y, a.z - b.z);
+        let add = |a: Vector, b: Vector| Vector::new(a.x + b.x, a.y + b.y, a.z + b.z);
+        let sc = |a: Vector, k: f32| Vector::new(a.x * k, a.y * k, a.z * k);
+        let k = 1 + (u() * 40.0) as usize;
+        let (mut tns, mut verts) = (Vec::new(), Vec::new());
+        for i in 0..k {
+            let off = match (u() * 10.0) as usize {
+                0 => Vector::default(),
+                1 => Vector::new(f32::from_bits(mv.x.to_bits() & 0x8000_0000 | 1), 0.0, 0.0),
+                _ => sc(mv, i as f32 / k as f32),
+            };
+            let (v0, v1, v2) = (add(b0, off), add(b1, off), add(b2, off));
+            let (a, b) = (sub(v1, v0), sub(v2, v0));
+            let mut n = Vector::new(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x);
+            let mut d = n.x * v0.x + n.y * v0.y + n.z * v0.z;
+            let axis = if n.x.abs() >= n.y.abs() && n.x.abs() >= n.z.abs() { 1 } else if n.y.abs() >= n.z.abs() { 2 } else { 3 };
+            if u() < 0.02 {
+                let sp = [f32::NAN, f32::INFINITY, -f32::INFINITY, 0.0][(u() * 4.0) as usize % 4];
+                if u() < 0.5 { n.y = sp } else { d = sp }
+            }
+            let base = verts.len();
+            for v in [v0, v1, v2] {
+                verts.push(RVertex { world: v, ..RVertex::default() });
+            }
+            let void = u() < 0.05;
+            let v = if void && u() < 0.5 { [None; 3] } else { [Some(base), Some(base + 1), Some(base + 2)] };
+            tns.push(Tn { v, n, d, axis, edge: [sub(v2, v1), sub(v0, v2), sub(v1, v0)], flags: if void { 0x8000 } else { 0 }, ..Tn::default() });
+        }
+        // the list: every triangle in a shuffled order, some twice
+        let mut order: Vec<usize> = (0..k).collect();
+        for i in (1..k).rev() {
+            order.swap(i, (u() * (i + 1) as f64) as usize % (i + 1));
+        }
+        if u() < 0.3 {
+            let dup = order[(u() * k as f64) as usize % k];
+            order.insert((u() * k as f64) as usize % k, dup);
+        }
+        let links: Vec<Link> = order.iter().enumerate().map(|(i, &tn)| Link { tn, next: (i + 1 < order.len()).then_some(i + 1), ..Link::default() }).collect();
+        let nodes = vec![Tree { list: Some(0), ..Tree::default() }];
+        // a ray from far on one side through the middle of the copies
+        let mid = sc(add(add(b0, b1), add(b2, sc(mv, 1.5))), 1.0 / 3.0);
+        let from_pt = add(mid, sc(pt(&mut u), 8.0));
+        let mut dir = sub(add(mid, sc(pt(&mut u), 0.3)), from_pt);
+        if u() < 0.02 {
+            dir.x = [0.0, f32::NAN, f32::INFINITY][(u() * 3.0) as usize % 3];
+        }
+        let ray = Ray { origin: from_pt, dir, ..Ray::default() };
+        let mut cell_limit = (1.0 + u() * 2.0) as f32;
+        if u() < 0.03 {
+            cell_limit = [f32::NAN, f32::INFINITY, 0.0][(u() * 3.0) as usize % 3];
+        }
+        let distance = if u() < 0.5 { cell_limit } else { (u() * 3.0) as f32 };
+        let from = if u() < 0.2 { order[0] } else { usize::MAX };
+        let tmin = if u() < 0.03 { f32::NAN } else if u() < 0.5 { SHADOW_TMIN } else { (u() * 0.5) as f32 };
+        let st = ShadeState { tns: tns.into(), verts: verts.into(), ..ShadeState::default() };
+        (st, Bsp { nodes: nodes.into(), links: links.into(), root: 0, outside: None }, ray, cell_limit, distance, from, tmin)
+    }
+
+    #[test]
+    fn replay_finds_what_the_search_finds() {
+        let mut r = si_x87::x87::testing::Rng(0x5eed_b10b);
+        let n = 30_000;
+        let (mut searches, mut multi, mut wrong, mut wrong_tf, mut wrong_first) = (0usize, 0usize, 0usize, 0usize, 0usize);
+        for _ in 0..n {
+            let (st, bsp, ray, cell_limit, distance, from, tmin) = blur_cell(&mut r);
+            let walk = |mode| cell_walk(&mut st.clone(), &bsp, ray, cell_limit, distance, from, tmin, mode);
+            let a = walk(0);
+            searches += a.len();
+            multi += (a.len() > 2) as usize;
+            if walk(1) != a {
+                wrong += 1;
+                eprintln!("replay differs: {:?} {cell_limit:e} {distance:e} {tmin:e}", ray);
+            }
+            wrong_tf += (walk(2) != a) as usize;
+            wrong_first += (walk(3) != a) as usize;
+        }
+        eprintln!("replay: {n} cells, {searches} searches ({multi} cells searched three times or more), {wrong} different; wrong replays: float(t) {wrong_tf}, first search only {wrong_first}");
+        assert_eq!(wrong, 0);
+        assert!(wrong_tf > 0 && wrong_first > 0, "the test cannot tell a wrong replay");
+        assert!(multi > n / 4, "{multi}");
     }
 }
 

@@ -129,7 +129,14 @@ fn install_args() -> Vec<String> {
 }
 
 fn main() {
+    // the add-on's light arrays (crates/si-render/src/softarray.rs): soft-arrays.txt beside the database, if there is one
+    if let Some(dir) = std::env::args().nth(1) {
+        si_render::softarray::load(std::path::Path::new(&dir));
+    }
     rensetup_main();
+    if let Some(r) = si_render::softarray::report() {
+        println!("{r}");
+    }
     let a = SUB_FIRST.load(std::sync::atomic::Ordering::Relaxed);
     if let (true, Some(dir)) = (a >= 0, std::env::var_os("RENSETUP_PICTURES")) {
         println!("sub-range: icon taken off {} picture(s) of frame {a}", strip_icon(std::path::Path::new(&dir), a));

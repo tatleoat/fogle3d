@@ -93,8 +93,11 @@ impl SampleEnv for BandWorld {
     }
 }
 
+/// A band's tracer: the tree shared with the frame's ([`crate::pool::Pool`]), the "met" marks
+/// of the shadow walk in a scratch of its own, as the triangles are shared too
+/// ([`crate::trace::MetMarks`]).
 fn clone_tracer(t: &Tracer) -> Tracer {
-    Tracer { bsp: t.bsp.clone(), mailbox: t.mailbox, chunk: t.chunk.clone(), heap: t.heap.clone() }
+    Tracer { bsp: t.bsp.clone(), mailbox: t.mailbox, chunk: t.chunk.clone(), heap: t.heap.clone(), arrays: t.arrays.clone(), shaft: Default::default(), met: crate::trace::MetMarks::scratch() }
 }
 
 fn work_bits(w: &MatWork) -> [u32; 20] {
@@ -222,7 +225,7 @@ fn line_costs(s: &Sampler, lp: &LineLoop, top: i16, n: usize) -> Vec<u64> {
             let mut len = 0u64;
             while let Some(k) = at {
                 len += 1;
-                at = s.slices[k].link;
+                at = s.slices[k].link.get();
                 if len > 1_000_000 {
                     break;
                 }
@@ -337,6 +340,7 @@ const STEAL_MIN: usize = 4;
 /// `RENDER_BANDS_STEAL=0` keeps the first cut.
 pub(crate) fn render(s: &mut Sampler, world: &mut World, adaptive: bool, n: usize) {
     let t0 = Instant::now();
+    let copies0 = crate::pool::copies();
     let strict = strict();
     let lp = if adaptive { s.supersample_begin(world) } else { s.sample_begin(world) };
     let top = s.region[3] as i16;
@@ -529,20 +533,56 @@ pub(crate) fn render(s: &mut Sampler, world: &mut World, adaptive: bool, n: usiz
         s.sample_end(world);
     }
     let t4 = Instant::now();
+    let copies1 = crate::pool::copies();
     let secs: Vec<String> = outs.iter().map(|o| format!("{:.3}", o.secs)).collect();
     let sizes: Vec<String> = (0..outs.len()).map(|b| (bounds[b + 1] - bounds[b]).to_string()).collect();
     eprintln!(
-        "bands\tthreads={n}\tadaptive={}\tlines={count}\tbands={}\treruns={reruns}\trerun_lines={rerun_lines}\tbegin_s={:.3}\tsample_s={:.3}\torder_s={:.3}\tout_s={:.3}\tsteals={steals}\tcopies={clones}\tband_s={}\tband_lines={}{}",
+        "bands\tthreads={n}\tadaptive={}\tlines={count}\tbands={}\treruns={reruns}\trerun_lines={rerun_lines}\tbegin_s={:.3}\tsample_s={:.3}\torder_s={:.3}\tout_s={:.3}\tsteals={steals}\tcopies={clones}\tshared_mb={:.1}\tper_copy_mb={:.1}\tpool_copies={}\tband_s={}\tband_lines={}{}",
         adaptive as i32,
         outs.len(),
         (t1 - t0).as_secs_f64(),
         (t2 - t1).as_secs_f64(),
         (t3 - t2).as_secs_f64(),
         (t4 - t3).as_secs_f64(),
+        shared_bytes(&world.st, &world.tracer) as f64 / 1e6,
+        (own_bytes(&world.st, &world.tracer) + sampler_bytes(s)) as f64 / 1e6,
+        copies1.0 - copies0.0,
         secs.join(","),
         sizes.join(","),
         if differ.is_empty() { String::new() } else { format!("\tdiffer={}", differ.join(";")) }
     );
+}
+
+/// The bytes of the arrays the band threads share with the frame's state ([`crate::pool::Pool`]):
+/// triangles, vertices, texture coordinates, the tree's nodes and links, the pictures' pixels.
+fn shared_bytes(st: &ShadeState, t: &Tracer) -> usize {
+    let pixels: usize = st.pictures.iter().map(|p| p.pixels.as_ref().map_or(0, |x| x.block.len())).sum();
+    st.tns.bytes() + st.verts.bytes() + st.uvs.bytes() + t.bsp.nodes.bytes() + t.bsp.links.bytes() + pixels
+}
+
+/// About the bytes a band's copy of the scene state and tracer holds of its own (the arrays'
+/// items only).
+fn own_bytes(st: &ShadeState, t: &Tracer) -> usize {
+    use std::mem::size_of_val;
+    let lights: usize = st.lights.iter().map(|l| size_of_val(l) + l.zmap.iter().map(|r| r.len() * 4).sum::<usize>() + l.select_table.len() * 4).sum();
+    st.materials.iter().map(|m| size_of_val(m) + 2 * 201 * 8).sum::<usize>()
+        + st.maps.len() * std::mem::size_of::<crate::shade::ShadeMap>()
+        + st.models.iter().map(|m| size_of_val(m) + m.materials.len() * 16).sum::<usize>()
+        + lights
+        + st.tex3ds.len() * std::mem::size_of::<crate::t3d_ren::ShadeTex3d>()
+        + t.heap.live.len() * 8
+        + t.heap.poked.len() * 8
+}
+
+/// About the bytes of a copy of the sampler (the arrays' items only).
+fn sampler_bytes(s: &Sampler) -> usize {
+    use std::mem::size_of;
+    s.slices.len() * size_of::<crate::render::Slice>()
+        + s.scan_lines.len() * size_of::<Option<usize>>()
+        + s.columns.len() * size_of::<Option<usize>>()
+        + s.line.len() * size_of::<Rgbazo>()
+        + s.ss.rows.iter().map(|r| r.len() * size_of::<Rgbazo>()).sum::<usize>()
+        + s.ss.winner.len() * size_of::<Ray>()
 }
 
 /// `RENDER_BANDS_STEAL=0`: the bands stay as first cut (no band takes over part of another).

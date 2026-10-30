@@ -20,22 +20,39 @@ on its own from the command line.
 ## Pictures
 
 Both pictures were rendered by Fogle3D from Blender scenes built from scratch for this page (our own geometry and
-generated textures; nothing from Softimage 3D's sample content). Settings and times are as measured on a 22-core Linux
-machine, 1920x1280 render, shown here at 1600 px.
+generated textures; nothing from Softimage 3D's sample content; the script is `re/tools/pics/make_scenes.py`). They
+are 1920x1280 renders with the add-on's default settings, shown here at 1600 px. The times were measured on a
+22-core Linux machine that was busy with other jobs at the same time (load average 50 to 80), so the wall-clock
+times are longer than on an idle machine; the CPU times (all threads added up) compare the two renderers more fairly.
 
 ![Glass and metal still life](docs/images/still-life-glass-metal.jpg)
 
 *Glass and metal still life: a wine glass and a ball in refracting glass, a chrome ball, two painted balls, on a
-generated checker floor in a room. Ray traced reflection and refraction (depth 8), hard ray traced shadows from the
-lights (the area light is rendered as a spot, so no soft shadows), no anti-aliasing settings changed. Fogle3D 2.5 s;
-the same scene in Blender Cycles, CPU, 128 samples, no denoising, took 86.6 s and shows soft shadows and glossy
-highlights that Fogle3D does not.*
+generated checker floor in a room, lit by an area light and a point light. Ray traced reflection and refraction (ray
+depth 4, chosen automatically for a scene with glass), soft shadows from the area light (drawn as 24 lights with
+ray traced shadows spread over its square: the setting Soft shadow lights, default 24), highlights sized from each
+material's roughness, the program's adaptive anti-aliasing. Fogle3D: 98 s wall clock, 405 s CPU. The same scene in
+Blender Cycles (CPU, 128 samples, no denoising, 8 bounces): 309 s wall clock, 1,763 s CPU.*
 
 ![NURBS vase and wine glass](docs/images/nurbs-vase-glass.jpg)
 
-*NURBS surfaces: a vase and a wine glass (surfaces of revolution, cubic NURBS), a torus and a sphere patch, with ray
-traced shadows. Fogle3D 5.8 s at 1920x1280; Blender Cycles, CPU, 128 samples, no denoising, 19.4 s. Fogle3D's
-picture is flatter: no soft shadows and no glossy highlights beyond a simple specular.*
+*NURBS surfaces: a vase and a wine glass (surfaces of revolution, cubic NURBS), a torus and a sphere patch, glossy
+painted materials, soft shadows from the area light (24 lights). Fogle3D: 55 s wall clock, 208 s CPU. Blender
+Cycles (CPU, 128 samples, no denoising): 68 s wall clock, 387 s CPU.*
+
+What is still approximate, next to Cycles:
+
+- A soft shadow is made of 24 sharp ones, so a wide penumbra can show faint steps where Cycles' is smooth. A higher
+  Soft shadow lights setting smooths it and takes longer.
+- A highlight is the program's round Phong spot: it does not take the shape of the light (Cycles shows the square
+  area light in the chrome and the painted balls).
+- Reflections are sharp mirror rays of the same strength at every angle (the program has no glossy blur and no
+  Fresnel term). Surfaces of medium roughness, such as the floors, the vase and the back wall, show a faint sharp
+  reflection where Cycles shows a blurred one or none.
+- Glass refracts and has a highlight but no reflection on its surface, its shadow lets 80% of the light through as
+  a flat tint, and there are no caustics.
+- There is no bounce light: what does not come from a light is a constant ambient term, so shaded areas are flatter
+  than in Cycles and colours do not bleed onto neighbouring surfaces.
 
 ## What is here
 

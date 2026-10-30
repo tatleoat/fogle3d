@@ -46,21 +46,52 @@ def run_render_frames(st, installed, only, extra_env, out_dir, size=None):
     env = dict(os.environ)
     env.update(install.program_env(root))
     env.update(extra_env)
-    thr = session.counts(1, False)[1]
-    if thr > 1:
-        env["RENDER_THREADS"] = str(thr)
+    thr = session.fit_threads(session.counts(1, False)[1], size, installed, st)
     env["RENSETUP_ONLY"] = only
     env["RENSETUP_PICTURES"] = out_dir
     os.makedirs(out_dir, exist_ok=True)
     log = os.path.join(out_dir, "run.txt")
-    # cap the renderer's address space as the corpus runs do (the chosen cap, or the automatic one for the picture)
-    mem_kb = session.memory_kb(st, size, thr)
-    with open(log, "wb") as fh:
-        p = subprocess.run(["/bin/sh", "-c", 'ulimit -v %d; exec "$0" "$1"' % mem_kb, exe, installed],
-                           env=env, stdout=fh, stderr=subprocess.STDOUT, timeout=3600)
+    # cap the renderer's address space as the corpus runs do (the chosen cap, or the automatic one for the picture and the
+    # database); a run that ran out of the automatic cap is tried again with more memory or fewer threads (session.attempts)
+    tries = session.attempts(st, size, thr, installed)
+    # the time limit grows with the picture (session.run_timeout); a run past session.LONG_JOB_S says so on the console
+    limit = session.run_timeout(size)
+    for i, (t, mem_kb) in enumerate(tries):
+        if t > 1:
+            env["RENDER_THREADS"] = str(t)
+        elif i:
+            env.pop("RENDER_THREADS", None)
+        with open(log, "wb") as fh:
+            p = subprocess.Popen(["/bin/sh", "-c", 'ulimit -v %d; exec "$0" "$1"' % mem_kb, exe, installed],
+                                 env=env, stdout=fh, stderr=subprocess.STDOUT)
+            try:
+                try:
+                    p.wait(timeout=min(limit, session.LONG_JOB_S))
+                except subprocess.TimeoutExpired:
+                    if limit <= session.LONG_JOB_S:
+                        raise
+                    print(session.long_job_message(size, t, session.LONG_JOB_S, limit), flush=True)
+                    p.wait(timeout=limit - session.LONG_JOB_S)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait()
+                raise RuntimeError("the renderer ran longer than its time limit of %d s for this picture (env "
+                                   "SI3D_RENDER_TIMEOUT sets it; see %s)" % (limit, log))
+        if p.returncode == 0 or i + 1 == len(tries) or not session.out_of_memory(_tail(log)):
+            break
     if p.returncode != 0:
         session.check_memory(log, mem_kb, size)
     return log, p.returncode
+
+
+def _tail(path, n=4000):
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, 2)
+            fh.seek(max(0, fh.tell() - n))
+            return fh.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
 
 
 def bpy_abspath(p):

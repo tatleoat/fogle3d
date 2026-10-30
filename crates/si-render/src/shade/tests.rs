@@ -62,7 +62,7 @@ fn scene() -> ShadeState {
     for (i, w) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)].iter().enumerate() {
         st.verts.push(RVertex { world: Vector::new(w.0, w.1, -5.0), raw: Vector::new(w.0, w.1, 0.0), normal: n, uv: 2 * i as u32, ..RVertex::default() });
     }
-    st.uvs = vec![[0.0, 0.0], [0.0, 0.0], [1.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.0, 1.0]];
+    st.uvs = vec![[0.0, 0.0], [0.0, 0.0], [1.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.0, 1.0]].into();
     st.tns.push(Tn { v: [Some(0), Some(1), Some(2)], n, d: -5.0, inv_d: -0.2, axis: 3, inv_n: 1.0, material: 0, w58: 0, ..Tn::default() });
     let mut m = ShadeMaterial { model: 3, vcol_rgb: 1, vcol_alpha: 1, ..ShadeMaterial::default() };
     m.work.diffuse = [1.0, 1.0, 1.0, 1.0];
@@ -529,7 +529,7 @@ fn textures_reset_then_apply_in_list_order() {
     st.models[0].maps = Some(2);
     // pair 1 of each corner: (0,0), (1,0), (0,1); pair 2 would be past the list: give the
     // corners three pairs
-    st.uvs = vec![[0.0; 2], [0.0, 0.0], [0.0, 0.0], [0.0; 2], [1.0, 0.0], [1.0, 0.0], [0.0; 2], [0.0, 1.0], [0.0, 1.0]];
+    st.uvs = vec![[0.0; 2], [0.0, 0.0], [0.0, 0.0], [0.0; 2], [1.0, 0.0], [1.0, 0.0], [0.0; 2], [0.0, 1.0], [0.0, 1.0]].into();
     for (i, v) in st.verts.iter_mut().enumerate() {
         v.uv = 3 * i as u32;
     }
@@ -552,7 +552,7 @@ fn map_wrap_and_repeat() {
     st.materials[0].model = 1;
     st.materials[0].flags = flag::TEXTURED;
     // u runs 0 → 5 across the triangle: at the hit u = 1.25, v = 0.25
-    st.uvs = vec![[0.0, 0.0], [0.0; 2], [5.0, 0.0], [0.0; 2], [0.0, 1.0], [0.0; 2]];
+    st.uvs = vec![[0.0, 0.0], [0.0; 2], [5.0, 0.0], [0.0; 2], [0.0, 1.0], [0.0; 2]].into();
     st.materials[0].maps = Some(0);
     // repeat: the fraction by floor, no region test
     st.maps.push(ShadeMap { method: 4, repeat: 1, ..ShadeMap::default() });

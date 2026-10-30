@@ -109,6 +109,40 @@ AUTO_BASE_MB = 2000
 AUTO_MB_PER_MPIXEL = 600
 AUTO_MB_PER_THREAD = 128
 AUTO_RAM_SHARE = 0.75
+# The geometry of a database built from a Blender scene (blend2db) adds to that: the renderer holds the triangles once, and
+# motion blur adds a copy of each moving model per step.  The band threads share the triangles, corners, texture coordinates,
+# pictures and tree read-only (unit blurmem1, si-render pool.rs); each keeps its own copy of the sampler's slices and the
+# scene's small state.  Measured on a 32x32-resolution NURBS scene (122 MB of model files, 980,000 triangles, 1920x1280,
+# re/out/blurmem1/m/n32_*): address space 1735 MB with one band thread and 3646 MB with 16 (8385 when every band copied the
+# triangles, unit mem1), i.e. about 1.05 MB per MB of model files and thread including each thread's own malloc arena and
+# stack; resident 39.6 MB per band (0.33 MB per MB).  AUTO_MB_PER_THREAD already counts the arena and stack; the factor
+# below gives a cap about twice the measured peak (7590 MB for that scene at 16 threads).
+AUTO_MB_PER_DB_MB_THREAD = 1
+AUTO_MB_PER_DB_MB = 1
+# The time limit of one unsupervised renderer run (runner.run_render_frames; the engine's supervised run has none: Esc stops
+# it): RUN_TIMEOUT_S for a picture of up to one million pixels and as much again for each further million.  A motion-blurred
+# 1920x1280 frame (the blur copies the moving models per step, more steps the larger the picture) had not finished after
+# 2 hours with 16 band threads on a loaded machine (unit blurmem1), nor after 45 minutes with the shadow walk's replay (blurmem2).  Env SI3D_RENDER_TIMEOUT (seconds) sets it.  A run longer than LONG_JOB_S says so once.
+RUN_TIMEOUT_S = 3600
+LONG_JOB_S = 60
+
+
+def run_timeout(size=None):
+    """The time limit in seconds of one unsupervised renderer run for a picture of `size` (width, height; None = unknown)."""
+    t = _env_int("SI3D_RENDER_TIMEOUT")
+    if t:
+        return t
+    mpx = int(size[0]) * int(size[1]) / 1e6 if size and size[0] and size[1] else 0.0
+    return int(RUN_TIMEOUT_S * max(1.0, mpx))
+
+
+def long_job_message(size, threads, seconds, limit=None):
+    """The Info line shown once when a render runs longer than LONG_JOB_S (`limit`: the run's time limit in seconds, for
+    an unsupervised run; else Esc stops it)."""
+    pic = "a %dx%d picture" % (size[0], size[1]) if size and size[0] and size[1] else "the picture"
+    end = ("its time limit is %d s (env SI3D_RENDER_TIMEOUT)" % limit) if limit else "Esc stops it"
+    return ("Fogle3D: still rendering %s with %d band thread%s after %d s; large pictures with motion blur or many "
+            "triangles can take many minutes (%s)" % (pic, threads, "" if threads == 1 else "s", int(seconds), end))
 # what a renderer that hit its cap prints (Rust's allocation failure; a thread whose stack could not be mapped)
 _OOM_SIGNS = ("memory allocation of ", "failed to spawn thread", "Cannot allocate memory", "out of memory")
 
@@ -125,12 +159,27 @@ def _ram_mb():
     return None
 
 
-def auto_memory_mb(size=None, threads=1):
-    """The automatic cap in MB for a picture of `size` (width, height; None = unknown, the base alone)."""
+def db_mb(root):
+    """The size in MB of the model files of a database blend2db built in `root` (0 for anything else: the user's install has
+    no db folder of its own at its top)."""
+    d = os.path.join(root, "db", "MODELS") if root else ""
+    try:
+        return sum(e.stat().st_size for e in os.scandir(d) if e.is_file()) / 1e6
+    except (OSError, TypeError):
+        return 0.0
+
+
+def auto_memory_mb(size=None, threads=1, db=0.0, clamp=True):
+    """The automatic cap in MB for a picture of `size` (width, height; None = unknown, the base alone), `threads` band
+    threads and `db` MB of model files (db_mb).  `clamp`: at most AUTO_RAM_SHARE of the machine's memory."""
     mb = AUTO_BASE_MB
     if size and size[0] and size[1]:
         mpx = max(0, int(size[0])) * max(0, int(size[1])) / 1e6
         mb += int(mpx * AUTO_MB_PER_MPIXEL + 0.999) + AUTO_MB_PER_THREAD * max(1, int(threads or 1))
+    if db:
+        mb += int(db * (AUTO_MB_PER_DB_MB + AUTO_MB_PER_DB_MB_THREAD * max(1, int(threads or 1))) + 0.999)
+    if not clamp:
+        return mb
     ram = _ram_mb()
     if ram:
         mb = min(mb, max(AUTO_BASE_MB, int(ram * AUTO_RAM_SHARE)))
@@ -147,10 +196,45 @@ def memory_mb_set(st=None):
     return mb or _env_int("SI3D_MEM_MB")
 
 
-def memory_kb(st=None, size=None, threads=1):
+def memory_kb(st=None, size=None, threads=1, root=None):
     """The address-space cap (KB, for ulimit -v) of one renderer process: the chosen one (memory_mb_set), else
-    the automatic one for the picture `size` and band `threads` (auto_memory_mb)."""
-    return (memory_mb_set(st) or auto_memory_mb(size, threads)) * 1000
+    the automatic one for the picture `size`, band `threads` and the database in `root` (auto_memory_mb)."""
+    return (memory_mb_set(st) or auto_memory_mb(size, threads, db_mb(root))) * 1000
+
+
+def fit_threads(thr, size=None, root=None, st=None):
+    """Band threads for a still: `thr`, fewer when the automatic cap for that many (a big database copied per thread) would pass
+    AUTO_RAM_SHARE of the machine's memory; never when the threads or the cap were chosen."""
+    pr = prefs()
+    if thr <= 1 or memory_mb_set(st) or (pr.band_threads if pr is not None else 0) or _env_int("SI3D_BAND_THREADS"):
+        return thr
+    ram, db = _ram_mb(), db_mb(root)
+    if not ram or not db:
+        return thr
+    while thr > 1 and auto_memory_mb(size, thr, db, clamp=False) > ram * AUTO_RAM_SHARE:
+        thr = max(1, thr // 2)
+    return thr
+
+
+def attempts(st, size, thr, root):
+    """The (threads, cap in KB) a still's renderer is tried with: first the automatic cap for `thr` threads; when it ran out
+    of memory (the cap is a prediction from the database's size; motion blur copies the moving models per step, which the
+    size does not show), up to AUTO_RAM_SHARE of the machine's memory with the same threads, then with a quarter of them and
+    with one.  A cap or thread count the user chose gives that one attempt only."""
+    first = memory_kb(st, size, thr, root)
+    if memory_mb_set(st):
+        return [(thr, first)]
+    out = [(thr, first)]
+    ram = _ram_mb()
+    big = int(ram * AUTO_RAM_SHARE) * 1000 if ram else 0
+    if big > first:
+        out.append((thr, big))
+        pr = prefs()
+        if not ((pr.band_threads if pr is not None else 0) or _env_int("SI3D_BAND_THREADS")):
+            for t in (max(1, thr // 4), 1):
+                if t < out[-1][0]:
+                    out.append((t, big))
+    return out
 
 
 def fit_processes(k, mem_kb):
@@ -449,15 +533,17 @@ def start_run(exe, root, only, extra_env, out_dir, frames, animation, dsc=None, 
         dsc = dsc or find_scene(root, only)
         why = parallel.stateful_reasons(dsc)
     k, thr = counts(len(frames) if frames else 1, animation)
-    k = fit_processes(k, memory_kb(st, size, thr))
+    thr = fit_threads(thr, size, root, st)
+    mem_kb = memory_kb(st, size, thr, root)
+    k = fit_processes(k, mem_kb)
     if frames is not None and not why and not alone and len(frames) > 1 and k > 1 and animation:
-        c = parallel.ParChild(exe, root, only, extra_env, out_dir, frames, k, thr, memory_kb(st, size, thr))
+        c = parallel.ParChild(exe, root, only, extra_env, out_dir, frames, k, thr, mem_kb)
         c.size = size
         return c
     env = dict(extra_env)
     if frames is not None and not why and not alone and len(frames) >= 1 and full is not None and list(frames) != list(full):
         env["RENDER_RANGE"] = "%d:%d" % (frames[0], frames[-1])      # a slice of the range, same bytes as in-range
-    c = Child(exe, root, only, env, out_dir, thr, memory_kb(st, size, thr), size)
+    c = Child(exe, root, only, env, out_dir, thr, mem_kb, size)
     c.sequential = sorted(why) if why else None
     c.frames = (full if why else frames) if frames is not None else None
     return c
@@ -666,15 +752,26 @@ def supervised_run_render_frames(engine):
         bad = problems(st, bpy.path.abspath)
         if bad:
             raise SessionError(bad[0])
-        thr = counts(1, False)[1]
-        child = Child(exe, installed, only, extra_env, out_dir, thr, memory_kb(st, size, thr), size)
-        while not child.exited():
-            if cancel_requested(engine):
-                child.cancel()
-                raise SessionError("cancelled")
-            f = child.files()
-            engine.update_stats("Fogle3D", "rendering, %d pictures, %.1f s" % (len(f), time.time() - child.t0))
-            child.nap(0.05)
+        thr = fit_threads(counts(1, False)[1], size, installed, st)
+        tries = attempts(st, size, thr, installed)
+        told = False
+        for i, (t, kb) in enumerate(tries):
+            child = Child(exe, installed, only, extra_env, out_dir, t, kb, size)
+            while not child.exited():
+                if cancel_requested(engine):
+                    child.cancel()
+                    raise SessionError("cancelled")
+                f = child.files()
+                el = time.time() - child.t0
+                engine.update_stats("Fogle3D", "rendering, %d pictures, %.1f s%s%s" % (
+                    len(f), el, " (more memory)" if i else "", " (long job, Esc stops it)" if el > LONG_JOB_S else ""))
+                if el > LONG_JOB_S and not told:
+                    told = True
+                    engine.report({"INFO"}, long_job_message(size, t, el))
+                child.nap(0.05)
+            # ran out of the automatic cap: the next attempt has more memory or fewer threads (attempts)
+            if child.returncode() == 0 or i + 1 == len(tries) or not out_of_memory(child.log_tail(4000)):
+                break
         if child.returncode() != 0:
             check_memory(child.log_path, child.mem_kb, size)
         return child.log_path, child.returncode()

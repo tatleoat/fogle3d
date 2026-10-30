@@ -78,6 +78,12 @@ def _material_values(mat, texdir=None):
                 d["roughness"] = n.inputs["Roughness"].default_value
                 d["metallic"] = n.inputs["Metallic"].default_value
                 d["ior"] = n.inputs["IOR"].default_value
+                # the highlight's inputs (unit gloss1, blend2db gloss.rs): Specular IOR Level and Tint, the coat
+                for key, name in (("specular_level", "Specular IOR Level"), ("specular_tint", "Specular Tint"),
+                                  ("coat", "Coat Weight"), ("coat_roughness", "Coat Roughness"), ("coat_ior", "Coat IOR")):
+                    if name in n.inputs:
+                        v = n.inputs[name].default_value
+                        d[key] = list(v)[:3] if hasattr(v, "__len__") else v
                 if "Emission Color" in n.inputs and n.inputs["Emission Strength"].default_value > 0:
                     e = n.inputs["Emission Color"].default_value
                     k = n.inputs["Emission Strength"].default_value
@@ -150,17 +156,62 @@ def _split_by_texture(od, materials):
         p["anim_name"] = od.get("anim_name", od["name"])        # the model's motion is the object's (or the instance's)
         p["tri_index"] = tis               # which of the object's triangles the part has (unit anim1: shapes)
         for f in ("tris", "tri_poly", "tri_normals", "tri_uv"):
-            if od[f]:
+            if od.get(f):
                 p[f] = [od[f][i] for i in tis]
+        if od.get("corner_x"):         # [triangle * 3 + corner, table index]: renumber for the part's triangles
+            where = {t: n for n, t in enumerate(tis)}
+            p["corner_x"] = [[where[x // 3] * 3 + x % 3, c] for x, c in od["corner_x"] if x // 3 in where]
         parts.append(p)
     return parts
 
 
+def _short(a):
+    """A float32 array as Python floats whose repr is the shortest decimal that reads back as the same float32 ('0.6123725'
+    where float32 -> double prints '0.6123724579811096'): the scene.json of a big mesh is a fifth of the size.  blend2db reads
+    them back through f32, so the numbers it uses are the same bits (unit mem1)."""
+    import numpy as np
+    if a.size == 0:
+        return a.tolist()
+    return a.astype(str).astype(np.float64).tolist()
+
+
+def _corners(lv, nrm, uv, nv):
+    """The corner table of a mesh: the distinct (normal, UV) values of its loops, and the table index of every loop.
+    The loops of a vertex usually agree (a smooth surface without UV seams), so entry i of the table is the value of vertex
+    i's first loop (zeros for a vertex no loop uses) and every other (normal, UV) combination gets an entry after the nv
+    vertex ones.  Returns (corner of each loop, normals, uvs or None)."""
+    import numpy as np
+    nl = len(lv)
+    cols = [np.ascontiguousarray(nrm, np.float32).view(np.uint32)]
+    if uv is not None:
+        cols.append(np.ascontiguousarray(uv, np.float32).view(np.uint32))
+    rows = np.concatenate(cols, axis=1) if nl else np.empty((0, 3), np.uint32)
+    used, first = np.unique(lv, return_index=True)
+    pick = np.zeros(nv, np.int64)
+    pick[used] = first
+    corner = lv.astype(np.int64)
+    if nl:
+        other = np.nonzero((rows != rows[pick[lv]]).any(axis=1))[0]
+    else:
+        other = np.zeros(0, np.int64)
+    if len(other):
+        r = np.ascontiguousarray(rows[other])
+        key = r.view(np.dtype((np.void, r.shape[1] * 4))).ravel()
+        _, at, inv = np.unique(key, return_index=True, return_inverse=True)
+        corner[other] = nv + inv.reshape(-1)
+        pick = np.concatenate([pick, other[at]])
+    cn = np.ascontiguousarray(nrm, np.float32)[pick] if nl else np.zeros((nv, 3), np.float32)
+    cuv = np.ascontiguousarray(uv, np.float32)[pick] if (uv is not None and nl) else (np.zeros((nv, 2), np.float32) if uv is not None else None)
+    return corner.astype(np.int32), cn, cuv
+
+
 def _mesh_lists(me):
     """The mesh's lists for the database: vertices, polygons (vertex indices, material, smooth flag), triangulation as Blender
-    does it with each triangle's corner normals and UVs, and the active UV layer.  Read in bulk (foreach_get into numpy, then
-    tolist(): the same Python floats and ints as reading the items one by one, 0.15 s less on a 16,000-triangle mesh; unit speed2).
-    Before Blender 4.1 (no corner_normals) the triangles' split normals are read one by one."""
+    does it, the corner table (distinct normals and UVs: `corner_normals`, `corner_uv`; corner i is vertex i's, the rest follow)
+    and the triangle corners that do not use their vertex's own entry (`corner_x`: [triangle * 3 + corner, table index]).  Read in bulk (foreach_get into numpy, then tolist(): the same Python floats and ints as reading the items
+    one by one, 0.15 s less on a 16,000-triangle mesh; unit speed2).  A 32x32-resolution NURBS scene had written each corner
+    of each triangle out in full, 17-digit floats (423 MB of scene.json); this form is a fifth of that (unit mem1).
+    Before Blender 4.1 (no corner_normals) the triangles' split normals are read one by one and written per triangle."""
     import numpy as np
     me.calc_loop_triangles()
     tris = me.loop_triangles
@@ -177,24 +228,29 @@ def _mesh_lists(me):
         cn = me.corner_normals            # Blender 4.1 and later: one normal per loop
     except AttributeError:
         cn = None
-    if cn is not None:
-        tri_normals = get(cn, "vector", nl, np.float32, 3)[tl].tolist() if nt else []
-    else:
-        tri_normals = [[list(t.split_normals[k]) for k in range(3)] for t in tris]
     uvl = me.uv_layers.active
     uv = get(uvl.data, "uv", nl, np.float32, 2) if uvl else None
-    starts = get(me.polygons, "loop_start", npl, np.int32).tolist()
-    totals = get(me.polygons, "loop_total", npl, np.int32).tolist()
-    lv = get(me.loops, "vertex_index", nl, np.int32).tolist()
-    return {
-        "verts": get(me.vertices, "co", nv, np.float32, 3).tolist() if nv else [],
-        "polys": [lv[a:a + n] for a, n in zip(starts, totals)],
+    lva = get(me.loops, "vertex_index", nl, np.int32)
+    out = {
+        "verts": _short(get(me.vertices, "co", nv, np.float32, 3)) if nv else [],
         "poly_material": get(me.polygons, "material_index", npl, np.int32).tolist(),
         "smooth": get(me.polygons, "use_smooth", npl, bool).tolist(),
         "tris": get(tris, "vertices", nt, np.int32, 3).tolist() if nt else [],
-        "tri_poly": get(tris, "polygon_index", nt, np.int32).tolist(),
-        "tri_normals": tri_normals, "tri_uv": uv[tl].tolist() if (uvl and nt) else [],
-        "uv": [uv.tolist() if nl else []] if uvl else []}
+        "tri_poly": get(tris, "polygon_index", nt, np.int32).tolist()}
+    if cn is not None:
+        loop_corner, cnrm, cuv = _corners(lva, get(cn, "vector", nl, np.float32, 3), uv, nv)
+        out["corner_normals"] = _short(cnrm)
+        out["corner_uv"] = _short(cuv) if cuv is not None and nt else []
+        if nt:
+            tc = loop_corner[tl].reshape(-1)
+            x = np.nonzero(tc != get(tris, "vertices", nt, np.int32, 3).reshape(-1))[0]
+            out["corner_x"] = np.stack([x, tc[x]], axis=1).tolist()
+        else:
+            out["corner_x"] = []
+    else:
+        out["tri_normals"] = [[list(t.split_normals[k]) for k in range(3)] for t in tris]
+        out["tri_uv"] = _short(uv[tl]) if (uvl and nt) else []
+    return out
 
 
 def _softimage_light(ob, frame):
@@ -263,6 +319,10 @@ def scene_to_dict(depsgraph, texdir=None):
                 e["spot_size"], e["spot_blend"] = li.spot_size, li.spot_blend
             if li.type == "AREA":
                 e["area_shape"], e["area_size"] = li.shape, [li.size, li.size_y]
+            elif li.type in ("POINT", "SPOT"):
+                e["radius"] = li.shadow_soft_size       # blend2db: soft shadows (unit soft1)
+            elif li.type == "SUN":
+                e["angle"] = li.angle
             si = _softimage_light(ob, scene.frame_current)
             if si is not None:
                 e["si"] = si
@@ -300,6 +360,68 @@ def scene_to_dict(depsgraph, texdir=None):
                 ob.to_mesh_clear()
         elif ob.type not in {"CAMERA", "EMPTY", "ARMATURE"}:
             out["skipped"].append("%s (%s)" % (ob.name, ob.type))
+    for name, s in key_spreads(depsgraph).items():
+        d = out["materials"].get(name)
+        if d is not None and "si" not in d:
+            d["key_spread"] = s         # the highlight's size (unit gloss1, blend2db gloss.rs)
+    return out
+
+
+def _key_light(li, mw):
+    """(position, forward, kind, power, size, cos of the half cone) of a Blender light: power by Cycles' fall-off
+    formulas (as blend2db's fit.rs), size the radius (point, spot), the radius of the disc of the same area (area) or
+    the angular radius (sun)."""
+    pos = [mw[0][3], mw[1][3], mw[2][3]]
+    z = [-mw[0][2], -mw[1][2], -mw[2][2]]
+    zl = max(math.sqrt(z[0] * z[0] + z[1] * z[1] + z[2] * z[2]), 1e-12)
+    fwd = [z[0] / zl, z[1] / zl, z[2] / zl]
+    e = max(li.energy, 0.0) * max(li.color[0], li.color[1], li.color[2])
+    pi = math.pi
+    if li.type == "SUN":
+        return pos, fwd, 3, e / pi, li.angle / 2.0, -1.0
+    if li.type == "AREA":
+        sx, sy = abs(li.size), abs(li.size_y)
+        area = {"SQUARE": sx * sx, "RECTANGLE": sx * sy, "DISK": pi * sx * sx / 4.0}.get(li.shape, pi * sx * sy / 4.0)
+        return pos, fwd, 2, e / (pi * pi), math.sqrt(area / pi), -1.0
+    cone = math.cos(li.spot_size / 2.0) if li.type == "SPOT" else -1.0
+    return pos, fwd, 1 if li.type == "SPOT" else 0, e / (4.0 * pi * pi), li.shadow_soft_size, cone
+
+
+def key_spreads(depsgraph):
+    """Per material name, the angular radius (radians, rounded to 6 places) of the light that lights the middle of
+    the objects using it most (unit gloss1): a mirror-like Principled surface shows that light's disc, which the
+    Softimage material's exponent has to widen to (blend2db gloss.rs).  The light's own orientation counts (area: the
+    cosine, spot: the cone), the surface's does not.  0 for a point or spot of radius 0, a sun of angle 0."""
+    from mathutils import Vector
+    lights, users = [], {}
+    for inst in depsgraph.object_instances:
+        ob = inst.object
+        mw = inst.matrix_world
+        if ob.type == "LIGHT":
+            lights.append(_key_light(ob.data, mw))
+        elif ob.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"} and ob.material_slots:
+            bb = [mw @ Vector(c) for c in ob.bound_box]
+            c = sum(bb, Vector()) / 8.0
+            for m in ob.material_slots:
+                if m.material:
+                    users.setdefault(m.material.name, []).append(c)
+    out = {}
+    for name, cs in users.items():
+        c = sum(cs, Vector()) / len(cs)
+        best, spread = 0.0, 0.0
+        for pos, fwd, kind, power, size, cone in lights:
+            if kind == 3:
+                lum, s = power, size
+            else:
+                d = [c[0] - pos[0], c[1] - pos[1], c[2] - pos[2]]
+                d2 = max(d[0] * d[0] + d[1] * d[1] + d[2] * d[2], 1e-9)
+                dl = math.sqrt(d2)
+                cosf = (d[0] * fwd[0] + d[1] * fwd[1] + d[2] * fwd[2]) / dl
+                k = max(cosf, 0.0) if kind == 2 else (0.0 if kind == 1 and cosf < cone else 1.0)
+                lum, s = power * k / d2, math.atan(size / dl)
+            if lum > best:
+                best, spread = lum, s
+        out[name] = round(spread, 6)
     return out
 
 
@@ -418,7 +540,7 @@ def render_options(scene, st):
         # pixels that are not square (an imported NTSC set-up: PIXEL_RATIO 0.9): the renderer widens the camera's
         # view by the set-up's pixel ratio, width over height of a pixel (unit fidelity2)
         setup["PIXEL_RATIO"] = "%.9g" % (pax / pay)
-    out = {"setup": setup}
+    out = {"setup": setup, "soft_lights": int(getattr(st, "soft_lights", 24))}
     depth = int(getattr(st, "ray_depth", 0) or 0)
     if depth > 0:                    # MAX_RAY_DEPTH as set; 0 leaves blend2db's own rule
         out["ray_depth"] = depth

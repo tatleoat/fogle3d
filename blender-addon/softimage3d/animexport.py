@@ -235,7 +235,7 @@ def still_loops(parts, s):
     (polygon, vertex); None when the still and the sample differ in topology."""
     import numpy as np
     sig, lv, lstart = s[0], s[4], s[5]
-    if not parts or len(parts[0]["verts"]) != sig[0] or len(parts[0].get("polys", ())) != len(lstart):
+    if not parts or len(parts[0]["verts"]) != sig[0] or len(parts[0].get("poly_material", ())) != len(lstart):
         return None
     nv, nl = sig[0], sig[1]
     totals = np.diff(np.append(lstart, nl))

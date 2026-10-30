@@ -223,7 +223,7 @@ fn slices_of(c: &Case) -> Vec<Slice> {
         .map(|k| {
             let f = c.input(&format!("sl{k}"));
             let w = f.words();
-            Slice { key: fl(f, 0), x0: fl(f, 1), dx0: fl(f, 2), x1: fl(f, 3), dx1: fl(f, 4), y_end: bits(f, 5) as i32, tn: numbered(&w[6], "tn").expect("a slice names its triangle"), next: numbered(&w[7], "sl"), link: numbered(&w[8], "sl"), by_depth: numbered(&w[9], "sl") }
+            Slice { key: fl(f, 0), x0: fl(f, 1), dx0: fl(f, 2), x1: fl(f, 3), dx1: fl(f, 4), y_end: bits(f, 5) as i32, tn: numbered(&w[6], "tn").expect("a slice names its triangle") as u32, next: numbered(&w[7], "sl").into(), link: numbered(&w[8], "sl").into(), by_depth: numbered(&w[9], "sl").into() }
         })
         .collect()
 }
@@ -262,7 +262,7 @@ fn same_scene(c: &Case, w: &World, slices: &[Slice], head: Option<usize>) -> Res
     for (k, s) in slices.iter().enumerate() {
         let f = c.after(&format!("sl{k}"));
         let fw = f.words();
-        if bits(f, 0) != s.key.to_bits() || numbered(&fw[8], "sl") != s.link || numbered(&fw[9], "sl") != s.by_depth {
+        if bits(f, 0) != s.key.to_bits() || numbered(&fw[8], "sl") != s.link.get() || numbered(&fw[9], "sl") != s.by_depth.get() {
             return Err(format!("slice {k}: original key {:08x} link {:?} depth {:?}, port {:08x} {:?} {:?}", bits(f, 0), fw[8], fw[9], s.key.to_bits(), s.link, s.by_depth));
         }
     }
@@ -580,7 +580,7 @@ fn render_frame(c: &Case, unset: f32) -> Vec<Vec<Rgbazo>> {
         .map(|k| {
             let f = c.input(&format!("f_sl{k}"));
             let fw = f.words();
-            Slice { key: fl(f, 0), x0: fl(f, 1), dx0: fl(f, 2), x1: fl(f, 3), dx1: fl(f, 4), y_end: bits(f, 5) as i32, tn: numbered(&fw[6], "tn").expect("a slice names its triangle"), next: numbered(&fw[7], "sl"), link: None, by_depth: None }
+            Slice { key: fl(f, 0), x0: fl(f, 1), dx0: fl(f, 2), x1: fl(f, 3), dx1: fl(f, 4), y_end: bits(f, 5) as i32, tn: numbered(&fw[6], "tn").expect("a slice names its triangle") as u32, next: numbered(&fw[7], "sl").into(), link: None.into(), by_depth: None.into() }
         })
         .collect();
     let bytes = || vec![0u8; w + 10];

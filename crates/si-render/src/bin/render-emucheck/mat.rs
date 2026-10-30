@@ -618,7 +618,7 @@ impl ShadeEnv for Recorded3d {
 fn check_shadow_map(c: &Case) -> Verdict {
     let mut st = ShadeState::default();
     let (ray_im, tn_im, mat_im, mdl_im) = (Image::of(c.input("ray")), Image::of(c.input("tn")), Image::of(c.input("mat")), Image::of(c.input("mdl")));
-    st.verts = vec![si_math::geometry::RVertex::default(); 3];
+    st.verts = vec![si_math::geometry::RVertex::default(); 3].into();
     let maps = add_textures(&mut st, c);
     let t3 = ["t0".to_string(), "t1".to_string()];
     let l = crate::outer::Loaded::of(c);

@@ -329,6 +329,51 @@ def ui_test():
 
 # ---------------------------------------------------------------- identity
 
+def _as_before(d, old_form):
+    """The exporter's data in the form of the exporter before the nodes (unit mem1 made the meshes compact: shortest-decimal
+    float32 numbers, a corner table with `corner_x` for the triangle corners that do not use their vertex's own entry, no
+    `polys` and `uv`): the corner normals and UVs per triangle, the mesh floats as float32 bits, `polys` and `uv` left out."""
+    import struct
+    import copy
+    d = copy.deepcopy(d)
+    f32 = lambda v: struct.unpack("<f", struct.pack("<f", v))[0]
+    for o in d["objects"]:
+        if "corner_normals" in o:
+            tris = o["tris"]
+            cx = {x: c for x, c in o.get("corner_x", [])}
+            ci = lambda ti, k: cx.get(ti * 3 + k, tris[ti][k])
+            o["tri_normals"] = [[o["corner_normals"][ci(ti, k)] for k in range(3)] for ti in range(len(tris))]
+            o["tri_uv"] = [[o["corner_uv"][ci(ti, k)] for k in range(3)] for ti in range(len(tris))] if o["corner_uv"] else []
+            for k in ("corner_normals", "corner_uv", "corner_x"):
+                del o[k]
+        o.pop("polys", None)
+        o.pop("uv", None)
+        o["verts"] = [[f32(x) for x in v] for v in o["verts"]]
+        o["tri_normals"] = [[[f32(x) for x in n] for n in t] for t in o["tri_normals"]]
+        o["tri_uv"] = [[[f32(x) for x in n] for n in t] for t in o["tri_uv"]]
+    return d
+
+
+# Keys the exporter gained after the nodes' baseline (SI3D_OLD_EXPORT, commit 5bf576e) for features of their own, left
+# out of the "as before the nodes" comparison (unit softspeed1; the baseline stays the export before the nodes):
+# soft shadows (unit soft1: a light's radius or angle, the Soft shadow lights setting), glossy highlights (unit gloss1:
+# the Principled node's highlight inputs and the key light's spread).
+LATER_LIGHT_KEYS = ("radius", "angle")
+LATER_MATERIAL_KEYS = ("specular_level", "specular_tint", "coat", "coat_roughness", "coat_ior", "key_spread")
+LATER_RENDER_KEYS = ("soft_lights",)
+
+
+def without_later_keys(d, render=False):
+    """A copy of the exporter's scene data (or, with render, its render options) without LATER_*_KEYS."""
+    if render:
+        return {k: v for k, v in d.items() if k not in LATER_RENDER_KEYS}
+    d = dict(d)
+    d["lights"] = [{k: v for k, v in e.items() if k not in LATER_LIGHT_KEYS} for e in d.get("lights", [])]
+    d["materials"] = {n: {k: v for k, v in m.items() if k not in LATER_MATERIAL_KEYS}
+                      for n, m in d.get("materials", {}).items()}
+    return d
+
+
 def identity_test():
     old = old_export()
     for emission in (False, True):
@@ -341,9 +386,11 @@ def identity_test():
         d_new = export.scene_to_dict(dg, texdir)
         if old is not None:
             d_old = old.scene_to_dict(dg, texdir)
-            check("%s: exporter data as before the nodes" % tag, json.dumps(d_old) == json.dumps(d_new))
+            check("%s: exporter data as before the nodes" % tag,
+                  json.dumps(without_later_keys(_as_before(d_old, True))) == json.dumps(without_later_keys(_as_before(d_new, False))))
             check("%s: render options as before" % tag,
-                  json.dumps(old.render_options(sc, sc.si3d)) == json.dumps(export.render_options(sc, sc.si3d)))
+                  json.dumps(without_later_keys(old.render_options(sc, sc.si3d), True))
+                  == json.dumps(without_later_keys(export.render_options(sc, sc.si3d), True)))
         else:
             print("TEST %s: exporter before the nodes not given (SI3D_OLD_EXPORT), not compared" % tag)
         db_p, data_p = build_db(tag + "-principled")

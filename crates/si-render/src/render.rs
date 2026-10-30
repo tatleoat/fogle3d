@@ -31,13 +31,48 @@ pub struct Slice {
     /// +0x14: last scan line.
     pub y_end: i32,
     /// +0x18: the triangle.
-    pub tn: usize,
+    pub tn: u32,
     /// +0x1c: next record filed under the same scan line.
-    pub next: Option<usize>,
+    pub next: SliceRef,
     /// +0x20: next record of the list of slices covering the current pixel.
-    pub link: Option<usize>,
+    pub link: SliceRef,
     /// +0x24: next record in depth order, nearest first (written by `SI_Sample`).
-    pub by_depth: Option<usize>,
+    pub by_depth: SliceRef,
+}
+
+/// A slice's pointer to another slice: its index in [`Sampler::slices`] plus one, 0 for none.
+/// Four bytes where an `Option<usize>` takes sixteen, so a slice takes 40 bytes, as the
+/// original's record does: every band thread holds a copy of all the frame's slices
+/// ([`crate::bands`]; unit blurmem1). Its `Debug` text is the `Option<usize>`'s.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub struct SliceRef(u32);
+
+const _: () = assert!(std::mem::size_of::<Slice>() == 40);
+
+impl SliceRef {
+    pub const NONE: SliceRef = SliceRef(0);
+
+    /// The slice's index, or `None`.
+    #[inline(always)]
+    pub fn get(self) -> Option<usize> {
+        (self.0 as usize).checked_sub(1)
+    }
+}
+
+impl From<Option<usize>> for SliceRef {
+    #[inline(always)]
+    fn from(v: Option<usize>) -> SliceRef {
+        match v {
+            None => SliceRef(0),
+            Some(i) => SliceRef(u32::try_from(i + 1).expect("fewer than 2^32 - 1 slices")),
+        }
+    }
+}
+
+impl std::fmt::Debug for SliceRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.get().fmt(f)
+    }
 }
 
 /// 0x086542b0, double: a ray whose direction · plane normal is smaller than this in size
@@ -196,24 +231,58 @@ fn certain_miss_k(ray: &Ray, tn: &Tn, verts: &[RVertex], tmin: f32, k: f64) -> b
 /// [`intersect`] from the plane on, as the original computes it.
 #[inline(always)]
 fn intersect_exact(ray: &mut Ray, tn: &Tn, verts: &[RVertex], tn_index: usize, tmin: f32) -> bool {
+    match exact_hit(ray, tn, verts, tmin) {
+        Some(h) => {
+            ray.t = h.tf;
+            ray.hit = h.hit;
+            ray.tn = Some(tn_index);
+            true
+        }
+        None => false,
+    }
+}
+
+/// What [`intersect`] would store for one triangle, with the distance `t` it compared.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Hit {
+    /// The plane distance in the register, as the range tests compare it.
+    pub t: F80,
+    /// float(t): what the ray gets.
+    pub tf: f32,
+    /// The three weights rounded to float: what the ray gets.
+    pub hit: Vector,
+}
+
+/// [`intersect_exact`]'s arithmetic without the store: the hit it would store, if any.
+#[inline(always)]
+fn exact_hit(ray: &Ray, tn: &Tn, verts: &[RVertex], tmin: f32) -> Option<Hit> {
     let (o, d, n) = (ray.origin, ray.dir, tn.n);
     let dn = fx!((add (mul (f d.z) (f n.z)) (add (mul (f d.y) (f n.y)) (mul (f n.x) (f d.x)))));
     if dn.abs().lt(x(PARALLEL)) {
-        return false;
+        return None;
     }
     let t = fx!((div (sub (f tn.d) (add (mul (f o.z) (f n.z)) (add (mul (f o.y) (f n.y)) (mul (f o.x) (f n.x))))) (x dn)));
     if t.ge(x(ray.t)) || t.lt(x(tmin)) {
-        return false;
+        return None;
     }
     let tf = t.to_f32();
     let w = weights(tn, verts, [fx!((add (f o.x) (mul (f tf) (f d.x)))), fx!((add (f o.y) (mul (f tf) (f d.y)))), fx!((add (f o.z) (mul (f tf) (f d.z))))]);
     if !inside(&w, axis_normal(tn)) {
-        return false;
+        return None;
     }
-    ray.t = tf;
-    ray.hit = Vector::new(w[0].to_f32(), w[1].to_f32(), w[2].to_f32());
-    ray.tn = Some(tn_index);
-    true
+    Some(Hit { t, tf, hit: Vector::new(w[0].to_f32(), w[1].to_f32(), w[2].to_f32()) })
+}
+
+/// [`intersect`] without `exclude` and without the store, for the ray's present distance
+/// and `tmin`: the hit it would store, or `None` where it would not. Ours (the shadow walk's
+/// replay of a cell, [`crate::trace::s_trace_marked`]); the same tests in the same order.
+#[inline(always)]
+pub(crate) fn probe(ray: &Ray, tns: &[Tn], verts: &[RVertex], tn_index: usize, tmin: f32) -> Option<Hit> {
+    let tn = &tns[tn_index];
+    if certain_miss(ray, tn, verts, tmin) {
+        return None;
+    }
+    exact_hit(ray, tn, verts, tmin)
 }
 
 /// A ray from the eye against the triangle of one slice [soft 0x0825f118 SI_Intersect1]:
@@ -225,20 +294,21 @@ fn intersect_exact(ray: &mut Ray, tn: &Tn, verts: &[RVertex], tn_index: usize, t
 /// triangle, which the original writes through its fourth argument in every case.
 /// Class: model.
 pub fn intersect1(ray: &mut Ray, slice: &Slice, tns: &[Tn], verts: &[RVertex], _tmin: f32) -> (i32, usize) {
-    let tn = &tns[slice.tn];
+    let t = slice.tn as usize;
+    let tn = &tns[t];
     if x(slice.key).eq(x(0.0f32)) {
-        return (2, slice.tn);
+        return (2, t);
     }
     let tf = fx!(f32: (div (x F80::ONE) (f slice.key)));
     let d = ray.dir;
     let w = weights(tn, verts, [fx!((mul (f tf) (f d.x))), fx!((mul (f tf) (f d.y))), fx!((mul (f tf) (f d.z)))]);
     if !inside(&w, axis_normal(tn)) {
-        return (2, slice.tn);
+        return (2, t);
     }
     ray.t = tf;
     ray.hit = Vector::new(w[0].to_f32(), w[1].to_f32(), w[2].to_f32());
-    ray.tn = Some(slice.tn);
-    (1, slice.tn)
+    ray.tn = Some(t);
+    (1, t)
 }
 
 /// The same test without the weights [soft 0x0825f6bc SI_Intersect2]: `SI_Intersect2(ray,
@@ -249,7 +319,7 @@ pub fn intersect2(ray: &mut Ray, slice: &Slice, tns: &[Tn], verts: &[RVertex]) -
     if x(slice.key).le(x(0.0f32)) {
         return 2;
     }
-    let tn = &tns[slice.tn];
+    let tn = &tns[slice.tn as usize];
     let tf = fx!(f32: (div (x F80::ONE) (f slice.key)));
     let d = ray.dir;
     let w = weights(tn, verts, [fx!((mul (f tf) (f d.x))), fx!((mul (f tf) (f d.y))), fx!((mul (f tf) (f d.z)))]);
@@ -257,7 +327,7 @@ pub fn intersect2(ray: &mut Ray, slice: &Slice, tns: &[Tn], verts: &[RVertex]) -
         return 2;
     }
     ray.t = tf;
-    ray.tn = Some(slice.tn);
+    ray.tn = Some(slice.tn as usize);
     0
 }
 
@@ -287,8 +357,8 @@ pub fn sample_layers(slices: &mut [Slice], head: &mut Option<usize>, tns: &[Tn],
     let mut sorted: Option<usize> = None;
     let mut cur = *head;
     while let Some(s) = cur {
-        cur = slices[s].link;
-        let tn = &tns[slices[s].tn];
+        cur = slices[s].link.get();
+        let tn = &tns[slices[s].tn as usize];
         let key = fx!((mul (add (add (mul (f d.x) (f tn.n.x)) (mul (f d.y) (f tn.n.y))) (mul (f d.z) (f tn.n.z))) (f tn.inv_d)));
         slices[s].key = key.to_f32();
         let mut before: Option<usize> = None;
@@ -298,21 +368,21 @@ pub fn sample_layers(slices: &mut [Slice], head: &mut Option<usize>, tns: &[Tn],
                 break;
             }
             before = at;
-            at = slices[a].by_depth;
+            at = slices[a].by_depth.get();
         }
         match before {
-            Some(b) => slices[b].by_depth = Some(s),
+            Some(b) => slices[b].by_depth = Some(s).into(),
             None => sorted = Some(s),
         }
-        slices[s].by_depth = at;
+        slices[s].by_depth = at.into();
     }
     if relink {
         let mut prev = None;
         let mut at = sorted;
         while let Some(a) = at {
-            slices[a].link = prev;
+            slices[a].link = prev.into();
             prev = at;
-            at = slices[a].by_depth;
+            at = slices[a].by_depth.get();
         }
         *head = prev;
     }
@@ -332,7 +402,7 @@ pub fn sample_layers(slices: &mut [Slice], head: &mut Option<usize>, tns: &[Tn],
             if r == 1 {
                 break;
             }
-            at = slices[a].by_depth;
+            at = slices[a].by_depth.get();
         }
         if ray.tn.is_none() {
             break;
@@ -342,7 +412,7 @@ pub fn sample_layers(slices: &mut [Slice], head: &mut Option<usize>, tns: &[Tn],
             break;
         }
         tmin = (x(ray.t) + LAYER_STEP).to_f32();
-        at = slices[at.expect("the hit slice")].by_depth;
+        at = slices[at.expect("the hit slice")].by_depth.get();
     }
     layers
 }
@@ -1060,10 +1130,10 @@ impl Sampler {
         let mut prev: Option<usize> = None;
         let mut cur = *active;
         while let Some(s) = cur {
-            let next = self.slices[s].next;
+            let next = self.slices[s].next.get();
             if self.slices[s].y_end > y as i32 {
                 match prev {
-                    Some(p) => self.slices[p].next = next,
+                    Some(p) => self.slices[p].next = next.into(),
                     None => *active = next,
                 }
             } else {
@@ -1079,7 +1149,7 @@ impl Sampler {
         // `update` lengthens the table to the grown window, so a frame does not get here)
         let filed = usize::try_from(y as i32).ok().and_then(|i| self.scan_lines.get(i).copied()).flatten();
         match prev {
-            Some(p) => self.slices[p].next = filed,
+            Some(p) => self.slices[p].next = filed.into(),
             None => *active = filed,
         }
         let mut i: i16 = 0;
@@ -1098,9 +1168,9 @@ impl Sampler {
                 x0
             };
             let col = x(v).to_i32(Round::Zero) as i16 as usize;
-            self.slices[s].link = self.columns[col];
+            self.slices[s].link = self.columns[col].into();
             self.columns[col] = Some(s);
-            cur = self.slices[s].next;
+            cur = self.slices[s].next.get();
         }
     }
 
@@ -1110,10 +1180,10 @@ impl Sampler {
         let mut prev: Option<usize> = None;
         let mut cur = *pixel;
         while let Some(s) = cur {
-            let next = self.slices[s].link;
+            let next = self.slices[s].link.get();
             if x(self.slices[s].x1).to_i32(Round::Zero) < xs as i32 {
                 match prev {
-                    Some(p) => self.slices[p].link = next,
+                    Some(p) => self.slices[p].link = next.into(),
                     None => *pixel = next,
                 }
             } else {
@@ -1123,7 +1193,7 @@ impl Sampler {
         }
         let joined = self.columns[xs as i32 as usize];
         match prev {
-            Some(p) => self.slices[p].link = joined,
+            Some(p) => self.slices[p].link = joined.into(),
             None => *pixel = joined,
         }
     }
@@ -1830,7 +1900,7 @@ mod tests {
         for v in verts[6..9].iter_mut() {
             v.world.x += 50.0;
         }
-        let mut slices: Vec<Slice> = (0..3).map(|i| Slice { tn: i, link: if i < 2 { Some(i + 1) } else { None }, ..Slice::default() }).collect();
+        let mut slices: Vec<Slice> = (0..3).map(|i| Slice { tn: i as u32, link: if i < 2 { Some(i + 1) } else { None }.into(), ..Slice::default() }).collect();
         let mut head = Some(0);
         let mut rays = vec![Ray::default(); 100];
         let bg = Rgbazo { r: 0.5, ..Rgbazo::default() };
@@ -1838,13 +1908,13 @@ mod tests {
         let out = sample(&mut env, &mut slices, &mut head, Vector::new(1.0, 1.0, -16.0), true, &mut rays, bg);
         // keys: 1/t for the unit direction; nearest first: triangle 2 (missed), 1, 0
         assert!(slices[2].key > slices[1].key && slices[1].key > slices[0].key);
-        assert_eq!((slices[2].by_depth, slices[1].by_depth, slices[0].by_depth), (Some(1), Some(0), None));
+        assert_eq!((slices[2].by_depth.get(), slices[1].by_depth.get(), slices[0].by_depth.get()), (Some(1), Some(0), None));
         // shaded back to front: the far one over the background, then the near one
         assert_eq!(env.order, vec![(0, 0.5, 1), (1, 1.5, 1)]);
         assert_eq!(out.r, 2.5);
         // the pixel's own list is now farthest first
         assert_eq!(head, Some(0));
-        assert_eq!((slices[0].link, slices[1].link, slices[2].link), (Some(1), Some(2), None));
+        assert_eq!((slices[0].link.get(), slices[1].link.get(), slices[2].link.get()), (Some(1), Some(2), None));
         // the unit direction went into the ray
         let len = (rays[0].dir.x * rays[0].dir.x + rays[0].dir.y * rays[0].dir.y + rays[0].dir.z * rays[0].dir.z).sqrt();
         assert!((len - 1.0).abs() < 1e-6);
@@ -1853,7 +1923,7 @@ mod tests {
         assert_eq!(env.chunk.marks, 1);
         // nothing hit: the background, untouched
         let mut head = Some(2);
-        slices[2].link = None;
+        slices[2].link = SliceRef::NONE;
         env.order.clear();
         let out = sample(&mut env, &mut slices, &mut head, Vector::new(1.0, 1.0, -16.0), false, &mut rays, bg);
         assert_eq!(out, bg);

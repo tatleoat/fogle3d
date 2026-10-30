@@ -20,6 +20,7 @@
 //! pointers into the model dictionary, the light list and chunk memory.
 
 use crate::types::{RVertex, Ray, Rgbazo, Tn, Vector};
+use crate::pool::Pool;
 use std::sync::LazyLock;
 use si_math::algebra::area_triangle_3d;
 use si_math::matrix::{camera_to_light, RenderCamera};
@@ -410,6 +411,10 @@ pub struct ShadeLight {
     pub soft_full: i32,
     pub soft_w128: f32,
     pub jitter: crate::jitter::Jitter,
+    /// Not a member of the original: the number (1, 2, ...) of the add-on's light array this light belongs to
+    /// (`soft-arrays.txt` beside the database, [`crate::softarray`]), whose shadow rays are answered by
+    /// [`ShadeEnv::s_array`]; 0 for every other light.
+    pub array: u32,
 }
 
 /// The renderer globals `shade.c` reads.
@@ -482,10 +487,12 @@ pub struct ShadeState {
     /// The four matrices at 0x087907ec (`reflect` uses the first for directions; `layerFog`
     /// its second column for heights).
     pub camera: RenderCamera,
-    pub tns: Vec<Tn>,
-    pub verts: Vec<RVertex>,
+    /// The triangle and vertex pools ([`Pool`]: shared by the band threads' copies until one
+    /// writes; unit blurmem1).
+    pub tns: Pool<Tn>,
+    pub verts: Pool<RVertex>,
     /// The (u, v) pairs the vertices' pointers at +0x40 point into.
-    pub uvs: Vec<[f32; 2]>,
+    pub uvs: Pool<[f32; 2]>,
     /// `Tn::material` is an index into this.
     pub materials: Vec<ShadeMaterial>,
     pub maps: Vec<ShadeMap>,
@@ -495,7 +502,7 @@ pub struct ShadeState {
     /// 0x087907e4: head of the light list.
     pub light_head: Option<usize>,
     /// The `glb_map` records: one per picture in use ([`crate::materials::GlbMap`]).
-    pub pictures: Vec<crate::materials::GlbMap>,
+    pub pictures: Pool<crate::materials::GlbMap>,
     /// The head of the picture list (`SI_getMapsList`; `SI_grafLists` +0x1c).
     pub picture_head: Option<usize>,
     /// The `__SI_Texture3D` records; a material's or model's `tex3d` is an index + 1.
@@ -546,6 +553,11 @@ pub trait ShadeEnv {
     /// The port is [`crate::trace::s_trace`]; it marks the triangles it meets and may change
     /// the working blocks of the transparent materials it passes, hence the mutable state.
     fn s_trace(&mut self, st: &mut ShadeState, ray: &mut Ray, tn: usize, distance: f32, light: usize) -> [f32; 4];
+    /// The shadow ray of a light of the add-on's light arrays (not the original's: [`crate::softarray`]); the
+    /// default traces it as [`ShadeEnv::s_trace`] does.
+    fn s_array(&mut self, st: &mut ShadeState, ray: &mut Ray, tn: usize, distance: f32, light: usize) -> [f32; 4] {
+        self.s_trace(st, ray, tn, distance, light)
+    }
     /// `si_trace(ray, tn)` (the port is [`crate::trace::trace`]): follows a secondary ray
     /// from triangle `tn`;
     /// true when it hits something, with the hit recorded in the ray.
@@ -1349,7 +1361,7 @@ fn lights<E: ShadeEnv>(st: &mut ShadeState, env: &mut E, ray: &Ray, tn_index: us
                     let mut sray = Ray { origin: p, dir: l, w38: ray.w38, ..Ray::default() };
                     let current = st.materials[mat].work;
                     st.materials[mat].work = saved;
-                    let left = env.s_trace(st, &mut sray, tn_index, dist.to_f32(), li);
+                    let left = if lt.array != 0 { env.s_array(st, &mut sray, tn_index, dist.to_f32(), li) } else { env.s_trace(st, &mut sray, tn_index, dist.to_f32(), li) };
                     st.materials[mat].work = current;
                     for k in 0..3 {
                         col[k] = (x(col[k]) * left[k]).to_f32();

@@ -135,6 +135,13 @@ class SI3DSettings(bpy.types.PropertyGroup):
     use_reflection: BoolProperty(name="Reflection", default=True, description="The program's GLG_REFLECT switch")
     use_refraction: BoolProperty(name="Refraction", default=True, description="The program's GLG_REFRACT switch")
     use_shadows: BoolProperty(name="Shadows", default=True, description="The program's GLG_SHADOW switch")
+    # unit soft1: a Blender light with a size is drawn as an array of lights with ray-traced shadows (blend2db soft.rs)
+    soft_lights: IntProperty(name="Soft shadow lights", default=24, min=1, max=256,
+                             description="A light with a size (area light, point or spot radius, sun angle) is drawn as "
+                                         "lights spread over its shape (2 per degree it spans, at most this many), each "
+                                         "with ray-traced shadows: soft shadows like Cycles'. Render time grows with the "
+                                         "count; more than 24 smooths the penumbra's steps further. 1 = one light, hard "
+                                         "shadows (fastest)")
 
 
 def _srgb_to_linear(c):
@@ -482,6 +489,7 @@ class SI3D_PT_settings(bpy.types.Panel):
         for p in ("use_materials", "use_textures_2d", "use_textures_3d", "use_reflection", "use_refraction",
                   "use_shadows"):
             grid.prop(st, p)
+        col.prop(st, "soft_lights")
         col.prop(st, "keep_dir")
         row = col.row()
         row.prop(st, "memory_mb")

@@ -12,7 +12,7 @@
 use crate::bsptree::{init_ancestry, BspBuild, BspParams, BspStats};
 use crate::camera::{camera, Camera};
 use crate::geometry::{traverse, Geometry, GeometryEnv};
-use crate::render::{filter_for_level, Sampler, Slice, Supersample};
+use crate::render::{filter_for_level, Sampler, Slice, SliceRef, Supersample};
 use crate::shade::ShadeState;
 use crate::trace::{Bsp, Link};
 use crate::geometry::RenModel;
@@ -384,7 +384,7 @@ impl Prepared {
         for (y, list) in self.g.bins.lines.iter().enumerate() {
             let mut next = None;
             for s in list {
-                slices.push(Slice { key: 0.0, x0: s.x0, dx0: s.dx0, x1: s.x1, dx1: s.dx1, y_end: s.y_end, tn: s.tn, next, link: None, by_depth: None });
+                slices.push(Slice { key: 0.0, x0: s.x0, dx0: s.dx0, x1: s.x1, dx1: s.dx1, y_end: s.y_end, tn: u32::try_from(s.tn).expect("fewer than 2^32 triangles"), next: next.into(), link: SliceRef::NONE, by_depth: SliceRef::NONE });
                 next = Some(slices.len() - 1);
             }
             scan_lines[y] = next;

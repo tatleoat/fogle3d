@@ -10,6 +10,10 @@ publish = false
 
 [workspace]
 
+[features]
+# the calibration override of src/gloss.rs (re/tools/gloss1/sweep.sh): development only
+gloss-tune = []
+
 [dependencies]
 si-ascii = { path = "../../../../crates/si-ascii" }
 si-elemio = { path = "../../../../crates/si-elemio" }

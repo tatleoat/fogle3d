@@ -3,6 +3,7 @@
 exporter sends to blend2db, the faults a node draws, and the conversion of a Principled material into Softimage nodes
 with the values the exporter would derive from it (blend2db's `material_for` formulas, step for step in single precision,
 so the converted material writes the same material file).  Field meanings: docs/design/softimage-nodes.md."""
+import math
 import struct
 
 from . import nodes as N
@@ -105,7 +106,9 @@ def texture_record(t):
             "channel": N.value_of(N.CHANNEL, t.channel), "ambient": t.ambient, "diffuse": t.diffuse,
             "specular": t.specular, "reflectivity": t.reflectivity, "transparency": t.transparency,
             "roughness": t.roughness, "reflection_map": t.reflection_map, "black_white": int(t.black_white),
-            "crop_flag": int(t.crop), "crop": [t.crop_x0, t.crop_x1, t.crop_y0, t.crop_y1]}
+            "crop_flag": int(t.crop), "crop": [t.crop_x0, t.crop_x1, t.crop_y0, t.crop_y1],
+            # the projection's frame (unit imp3; blend2db reads it for the projected methods only)
+            "rotation": list(t.rotation), "scaling": list(t.scaling), "translation": list(t.translation)}
 
 
 def texture3d_record(t):
@@ -317,6 +320,9 @@ def set_texture(node, v):
         node.crop = bool(v["crop_flag"])
     for k, x in zip(("crop_x0", "crop_x1", "crop_y0", "crop_y1"), v.get("crop") or ()):
         setattr(node, k, int(x))
+    for k in ("rotation", "scaling", "translation"):     # a projection's frame (unit imp3)
+        if v.get(k) is not None:
+            setattr(node, k, [float(x) for x in v[k][:3]])
 
 
 def new_texture_node(mat_node, image, values=None, scope="LOCAL", socket=None):
@@ -340,6 +346,114 @@ PRINCIPLED_TEXTURE = {"method": 4, "pixel_interp": 1, "uscale": 1.0, "vscale": 1
                       "urepeat": 1, "vrepeat": 1, "alt_u": 0, "alt_v": 0, "swap_uv": 0, "mask": 1, "blend": 1.0,
                       "channel": 2, "ambient": 1.0, "diffuse": 1.0, "specular": 0.0, "reflectivity": 0.0,
                       "transparency": 0.0, "roughness": 0.0, "reflection_map": 1.0, "black_white": 0}
+
+
+# blend2db gloss.rs's calibration (unit gloss1): kept equal to its TUNE.
+GLOSS = {"k_spec": 0.6, "c_size": 24.0, "r_diel": 0.12, "mirror_lo": 0.1, "mirror_hi": 0.8, "c_tint": 0.45, "c_rough": 0.5,
+         "n_max": 1000.0, "glass_o": 0.1, "glass_r": 0.0, "n_scale": 0.35}
+
+
+def _lobe_energy(n):
+    s = 0.0
+    for i in range(200):
+        vi = (i / 200.0) ** n
+        step = 1.0 if i == 199 else ((i + 1) / 200.0) ** n - vi
+        s += vi + step / 2.0
+    return 2.0 * math.pi * s / 200.0
+
+
+def _peak(n):
+    return (math.pi / 4.0) / _lobe_energy(n)
+
+
+def _exponent(rough, spread, t):
+    r = min(max(rough, 0.02), 1.0)
+    a = r * r
+    n_r = max(t["n_scale"] * (2.0 / (a * a) - 2.0), 1.0)
+    inv = 1.0 / n_r + (spread * spread / t["c_size"] if spread > 0.0 else 0.0)
+    return min(max(1.0 / inv, 1.0), t["n_max"])
+
+
+def gloss_values(d, t=GLOSS):
+    """blend2db gloss.rs `map` on the exporter's dict of an opaque Principled material: (diffuse, specular, exponent,
+    reflectivity), every operation in the same order in double precision, single precision at the end."""
+    def num(key, default):
+        v = d.get(key)
+        return float(default if v is None else v)
+
+    def three(key, default):
+        v = d.get(key)
+        if not isinstance(v, (list, tuple)):
+            return [default] * 3
+        return [float(v[i]) if i < len(v) and v[i] is not None else default for i in range(3)]
+    spread = max(num("key_spread", 0.0), 0.0)
+    tb = [srgb(c) for c in three("diffuse", 0.8)]
+    rough = min(max(num("roughness", 0.5), 0.0), 1.0)
+    metal = min(max(num("metallic", 0.0), 0.0), 1.0)
+    lv = d.get("specular_level")
+    lv = d.get("specular") if lv is None else lv
+    level = min(max(float(0.5 if lv is None else lv), 0.0), 1.0)
+    tint = [min(max(c, 0.0), 1.0) for c in three("specular_tint", 1.0)]
+    ior = max(num("ior", 1.5), 1.0)
+    q = (ior - 1.0) / (ior + 1.0)
+    f0 = min(max(q * q * 2.0 * level, 0.0), 1.0)
+    n = _exponent(rough, spread, t)
+    pk = _peak(n) * t["k_spec"]
+    w = min(max((t["mirror_hi"] - rough) / max(t["mirror_hi"] - t["mirror_lo"], 1e-6), 0.0), 1.0)
+    r_d = min(max(t["r_diel"] * w, 0.0), 0.99)
+    spec_d = [f0 * k * pk for k in tint]
+    tmin = min(1.0, tb[0], tb[1], tb[2])
+    r_m = min(max(w * tmin, 0.0), 0.99)
+    loc_m = [w * (tb[k] - tmin) * t["c_tint"] + (1.0 - w) * tb[k] * t["c_rough"] for k in range(3)]
+    spec_m = [k * pk for k in tb]
+    coat = min(max(num("coat", 0.0), 0.0), 1.0)
+    n_out, spec_c = n, 0.0
+    if coat > 0.0:
+        cior = max(num("coat_ior", 1.5), 1.0)
+        cq = (cior - 1.0) / (cior + 1.0)
+        cf0 = cq * cq
+        nc = _exponent(num("coat_roughness", 0.03), spread, t)
+        eb = metal * (tb[0] + tb[1] + tb[2]) / 3.0 + (1.0 - metal) * f0
+        ec = coat * cf0
+        n_out = math.exp((eb * math.log(n) + ec * math.log(nc)) / max(eb + ec, 1e-12))
+        spec_c = coat * cf0 * _peak(nc) * t["k_spec"]
+    r = metal * r_m + (1.0 - metal) * r_d
+    keep = max(1.0 - r, 1e-3)
+    diffuse = [f32((metal * loc_m[k] + (1.0 - metal) * (1.0 - r_d) * tb[k]) / keep) for k in range(3)]
+    specular = [f32((metal * spec_m[k] + (1.0 - metal) * (1.0 - r_d) * spec_d[k] + spec_c) / keep) for k in range(3)]
+    return diffuse, specular, f32(n_out), f32(r)
+
+
+def glass_values(d, t=GLOSS):
+    """blend2db gloss.rs `glass` on the exporter's dict of a clear Principled glass: (diffuse, specular, exponent,
+    reflectivity, transparency), or None when the calibration keeps glass as before."""
+    if t["glass_o"] <= 0.0:
+        return None
+
+    def num(key, default):
+        v = d.get(key)
+        return float(default if v is None else v)
+
+    def three(key, default):
+        v = d.get(key)
+        if not isinstance(v, (list, tuple)):
+            return [default] * 3
+        return [float(v[i]) if i < len(v) and v[i] is not None else default for i in range(3)]
+    spread = max(num("key_spread", 0.0), 0.0)
+    trans = min(max(num("transmission", 0.0), 0.0), 1.0)
+    o = min(max(t["glass_o"] * trans + (1.0 - trans), 1e-3), 1.0)
+    lv = d.get("specular_level")
+    lv = d.get("specular") if lv is None else lv
+    level = min(max(float(0.5 if lv is None else lv), 0.0), 1.0)
+    tint = [min(max(c, 0.0), 1.0) for c in three("specular_tint", 1.0)]
+    ior = max(num("ior", 1.5), 1.0)
+    q = (ior - 1.0) / (ior + 1.0)
+    f0 = min(max(q * q * 2.0 * level, 0.0), 1.0)
+    n = _exponent(min(max(num("roughness", 0.0), 0.0), 1.0), spread, t)
+    r = min(max(t["glass_r"] / o, 0.0), 0.95)
+    keep = o * (1.0 - r)
+    specular = [f32(f0 * k * _peak(n) * t["k_spec"] / keep) for k in tint]
+    return [0.0, 0.0, 0.0], specular, f32(n), f32(r), f32(1.0 - o)
 
 
 def principled_values(d):
@@ -371,6 +485,15 @@ def principled_values(d):
             v["shading"] = 1
             v["diffuse"] = list(ec)
             v["ambient"] = list(ec)
+    if transp <= 0.0 and e is None:     # an opaque surface: blend2db gloss.rs (unit gloss1)
+        g = gloss_values(d)
+        v.update({"ambient": list(g[0]), "diffuse": list(g[0]), "specular": list(g[1]), "exponent": g[2],
+                  "reflectivity": g[3], "transparency": 0.0})
+    elif trans > 0.0 and alpha >= 1.0 and e is None:    # a clear glass: gloss.rs `glass`
+        g = glass_values(d)
+        if g is not None:
+            v.update({"ambient": list(g[0]), "diffuse": list(g[0]), "specular": list(g[1]), "exponent": g[2],
+                      "reflectivity": g[3], "transparency": g[4]})
     if d.get("ior") is not None and transp > 0.0:
         v["refraction"] = f32(float(d["ior"]))
     return v
@@ -439,6 +562,9 @@ def convert_principled(mat):
     if material_node(mat) is not None:
         return None, ["%s already has a Softimage Material" % mat.name]
     d = export._material(mat, None)
+    if "si" not in d:       # the highlight's size, as the exporter gives it (unit gloss1)
+        import bpy
+        d["key_spread"] = export.key_spreads(bpy.context.evaluated_depsgraph_get()).get(mat.name, 0.0)
     notes = []
     tree = mat.node_tree if uses_nodes(mat) else None
     p = next((n for n in tree.nodes if n.bl_idname == "ShaderNodeBsdfPrincipled"), None) if tree else None

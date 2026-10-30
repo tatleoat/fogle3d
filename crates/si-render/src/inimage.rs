@@ -396,6 +396,7 @@ pub fn light_at(m: &Mem, a: u32, table_len: u32) -> ShadeLight {
         select_id: m.i32(a + 0x160),
         select_table: if table != 0 && m.is_mapped(table, 4 * table_len) { (0..table_len).map(|i| m.i32(table + 4 * i)).collect() } else { Vec::new() },
         on: m.i16(a + 0x176),
+        array: 0,
     }
 }
 

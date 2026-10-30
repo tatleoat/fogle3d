@@ -12,7 +12,7 @@ use crate::render::{Antialias, FrameEnv, SampleEnv};
 use crate::renutil::{LineSink, OutputLine, OutputState};
 use crate::rnd_tag::TagImage;
 use crate::shade::{shade, ShadeEnv, ShadeState};
-use crate::trace::{s_trace, search, shadow_map, trace, Bsp, Mailbox};
+use crate::trace::{s_trace_marked, search, shadow_map, trace, Bsp, Mailbox, MetMarks};
 use crate::types::{Ray, Rgbazo};
 use crate::update::Prepared;
 use si_math::geometry::{RVertex, Tn};
@@ -39,6 +39,14 @@ pub struct Tracer {
     pub mailbox: Mailbox,
     pub chunk: ChunkBuffer,
     pub heap: CountingHeap,
+    /// Not the original's: the hierarchy the shadow rays of the add-on's light arrays are first tested against
+    /// ([`crate::softarray`]); none for every other scene.
+    pub arrays: Option<std::sync::Arc<crate::softarray::Bvh>>,
+    /// The candidates of the last shaded point's shadow rays to an array ([`crate::softarray::Shaft`]).
+    pub shaft: crate::softarray::Shaft,
+    /// Where the shadow walk keeps its "met" marks: in the triangles on the frame's own state,
+    /// in a scratch on a band thread's ([`MetMarks`]).
+    pub met: MetMarks,
 }
 
 impl ShadeEnv for Tracer {
@@ -47,7 +55,31 @@ impl ShadeEnv for Tracer {
         search(&self.bsp.nodes, self.bsp.root, p).map_or(0, |n| n as u32)
     }
     fn s_trace(&mut self, st: &mut ShadeState, ray: &mut Ray, tn: usize, distance: f32, light: usize) -> [f32; 4] {
-        s_trace(&mut self.bsp, &mut self.mailbox, st, ray, tn, distance, light, &mut |st, ray, mat, p| shadow_map(st, &mut TexturesOnly, ray, mat, p))
+        s_trace_marked(&mut self.bsp, &mut self.mailbox, &mut self.met, st, ray, tn, distance, light, &mut |st, ray, mat, p| shadow_map(st, &mut TexturesOnly, ray, mat, p))
+    }
+    fn s_array(&mut self, st: &mut ShadeState, ray: &mut Ray, tn: usize, distance: f32, light: usize) -> [f32; 4] {
+        // a selective light's walk skips the models it does not light: traced as the original traces it
+        if let (0, Some(b)) = (st.lights[light].selective, &self.arrays) {
+            if crate::softarray::checking() {
+                let t0 = std::time::Instant::now();
+                let seen = b.shaft_hit(&mut self.shaft, st, light, ray.origin, ray.dir, tn, crate::softarray::SHADOW_TMIN, distance);
+                let t1 = std::time::Instant::now();
+                let walk = self.s_trace(st, ray, tn, distance, light);
+                let ns = ((t1 - t0).as_nanos() as u64, t1.elapsed().as_nanos() as u64);
+                crate::softarray::record(seen, walk, si_x87::fmov(st.lights[light].umbra), ns);
+                return walk;
+            }
+            let seen = b.shaft_hit(&mut self.shaft, st, light, ray.origin, ray.dir, tn, crate::softarray::SHADOW_TMIN, distance);
+            match seen {
+                crate::softarray::Seen::Clear => return [1.0, 1.0, 1.0, st.glb.unset],
+                crate::softarray::Seen::Opaque => {
+                    let u = si_x87::fmov(st.lights[light].umbra);
+                    return [u, u, u, st.glb.unset];
+                }
+                crate::softarray::Seen::Unsure => {}
+            }
+        }
+        self.s_trace(st, ray, tn, distance, light)
     }
     fn trace(&mut self, st: &ShadeState, ray: &mut Ray, tn: usize) -> bool {
         trace(&mut self.bsp, &mut self.mailbox, ray, &st.tns, &st.verts, tn)
@@ -226,7 +258,8 @@ pub fn render_with_depth(p: &mut Prepared, background_bytes: [u8; 4], dither: Op
     let chunk = chunk_allocate(&mut heap, 200, 5_000_000).expect("a chunk buffer");
     let bsp = std::mem::take(&mut p.bsp);
     let adaptive = p.options.adaptive == 1;
-    let mut world = World { st: &mut p.st, tracer: Tracer { bsp, mailbox: Mailbox { current: 0 }, chunk, heap }, lines: Vec::new(), status: Vec::new(), dither, depth: None };
+    let arrays = crate::softarray::Bvh::for_arrays(&p.st, &bsp);
+    let mut world = World { st: &mut p.st, tracer: Tracer { bsp, mailbox: Mailbox { current: 0 }, chunk, heap, arrays, shaft: Default::default(), met: MetMarks::InTriangles }, lines: Vec::new(), status: Vec::new(), dither, depth: None };
     world.tracer.chunk.initialize();
     // several threads inside the frame (`RENDER_THREADS`, crate::bands); one by default
     if crate::bands::probe_wanted() {

@@ -43,7 +43,7 @@ File > Import works from the zip alone with only the install path set (unit fini
 | `scene` | path, database, name |
 | `settings` | `frame_first`, `frame_last`, `frame_step`, `frame_rate`, `width`, `height`, `pixel_ratio`, `right_hand`, `back_culling` (the set-up's BACK_CULLING), `ray_depth` (MAX_RAY_DEPTH), `switches` (GLOBAL_SWITCHES: `material`, `textures_2d`, `textures_3d`, `reflection`, `refraction`, `shadows`), `antialias` (`mode` FIXED or ADAPTIVE, `filter`, `level`, `threshold`; null when the set-up has none), all read from the renderer's controls after the scene's set-up is loaded (a scene without a set-up file keeps their start values), `crop` (the set-up's sub-region as pixel cut-offs `left`, `right`, `top`, `bottom` and the region's `width`, `height`; null when off), `environment` (ambience, fog, and the depth `fade`: `on`, `start`, `end`, `color`, `transparency`, as the shading reads them) |
 | `models[]` | `id`, `name`, `kind` (-1 dummy, 0 null, 1 patch, 2 face, 4 mesh, 5 joint, 6 spline, 7/8 metaball, 9 NURBS curve, 10 NURBS surface), `father`, `visible`, `algorithm`, `scaling`/`rotation`/`translation`, `global_matrix`, `latdep`, `registered`, `normals_flipped`, `materials`, `texture3d` (the node's own 3D texture, an id in `textures3d`, or null), `geometry` or `geometry_of` (a node that shares another node's definition) |
-| `geometry` | `type` `mesh` (`vertices`, `polygons` with -1 between contours, per-corner `normals` (all zero on a faceted mesh: the renderer uses each polygon's own normal), `polygon_material`, `hidden`, `uv` per texture), `triangles` (the renderer's triangles, for patches, faces, NURBS surfaces), or `spline` |
+| `geometry` | `type` `mesh` (`vertices`, `polygons` with -1 between contours, per-corner `normals` (often all zero on a faceted mesh; whatever they hold, the renderer uses each polygon's own normal when the mesh is faceted), `polygon_material`, `hidden`, `uv` per texture), `triangles` (the renderer's triangles, for patches, faces, NURBS surfaces), or `spline` |
 | `materials[]`, `textures[]` | the records' fields (shading model, colours, exponent, reflectivity, transparency, refraction; texture method, mask, blend, channel, factors, scales, offsets, repeats, crop, picture `file` and whether it was `found`); a material's `texture3d` is an id in `textures3d` or null |
 | `textures3d[]` | the 3D (procedural) texture records at the first frame: `kind`, `spacing`, `taper`, `strength`, `iterations`, `power`, `mask`, `blending`, `channel`, five `colours`, three `factors` (colour stops), `scaling`/`rotation`/`translation`, and the ambient, diffuse, specular, reflection, transparency and roughness factors |
 | `camera` | position, interest, roll, fov, near, far, camera/view/perspective matrices, picture window, depth of field |
@@ -73,16 +73,22 @@ corners, `re/tools/extra2/uvcmp.py`).
 - **One collection per scene**, named after it, with the child collections `<scene> camera` and `<scene> lights`.
   Objects are parented as the scene's tree has them. Dummy roots are left out.
 - **Meshes** get their polygons, smooth or flat normals as the renderer has them, one UV layer per texture, and
-  material slots per polygon. A polygon none of whose corners has a normal (a faceted mesh) is flat, with Blender's
-  zero custom normal ("the face's own"). Patches, faces and NURBS surfaces become the renderer's own triangles.
+  material slots per polygon. A polygon none of whose corners has a normal is flat, with Blender's zero custom
+  normal ("the face's own"). Every polygon of a faceted mesh (mesh flag 0x2) is flat too, even when its corners store
+  smooth normals (PICTURE-SKELETON's head does), and keeps the scene's winding, which gives its normal. Patches, faces and NURBS surfaces become the renderer's own triangles.
 - **Splines** become curves. Joints, NURBS curves and metaballs become empties.
 - **Materials** use the Softimage Material and Softimage Texture nodes (unit nodes1), plus a Principled BSDF for
   Blender's own engines. A texture the renderer projects (XY, XZ, YZ, cylinder, sphere) can become a UV texture
   with the renderer's coordinates (option "Projections as UV", on by default), so it stays put when the object moves.
   The first texture of a material does; a later projected one does too when its coordinates are the first's on every
   model that has both (they then share the render UV layer, and blend2db writes both: unit extra2, Torch_Fire's flame
-  and its textured shadow). A bump map made UV bumps along the UV frame, not the projection's axes (see
-  docs/import-fidelity.md, MATTER-displacement).
+  and its textured shadow). A bump map made UV would bump along the UV frame, not the projection's fixed axes, so
+  a planar (XY, XZ, YZ) texture that bumps stays a projection (unit imp3): the SI Texture node keeps the method
+  and the projection's scaling, rotation and translation, and blend2db, which writes the vertices in world space,
+  folds the object's matrix into that rotation (`simat::texture2d_object_space`; the projection fits each axis to
+  the model's bounding box, so a scaling along the projection's axes drops out). The importer does this only where
+  the fold is exact for every model carrying the texture (no lattice or deformation, the object's matrix seen
+  through the projection's rotation a scaling along its axes); elsewhere the texture becomes UV as before.
   A 3D (procedural) texture becomes a Softimage 3D Texture node on the material node's 3D Texture input, with the
   first frame's values. A node's own 3D texture (the renderer applies it where the material has none) goes on a
   copy of the material, named `<material> +3D texture <name>`; a node that shares a mesh but has another 3D texture
@@ -115,13 +121,15 @@ corners, `re/tools/extra2/uvcmp.py`).
   objects included) or `unlit` (only exclusions); blend2db writes the light file's SELECTIVE (on, value 1 for `lit`,
   0 for `unlit`) and one `CHAPTER LIGHTS CHAPTER MODELS` relation 2200 per model, so the renderer's own test
   decides.
-- **Animation**: matrices are baked to linear keyframes on every frame of the range. Shape animation and deformation
+- **Animation**: matrices are baked to linear keyframes on every frame of the range (blend2db writes a camera's
+  roll as a curve of its own when it changes, unit imp3). Shape animation and deformation
   become one shape key per frame, keyed 0/1 around its frame, up to a budget of 40 M floats.
 - **Scene settings**:
   - frame range, step and rate; resolution and pixel aspect (export.py hands a pixel aspect other than 1 to blend2db as the set-up's PIXEL_RATIO, x over y; the renderer widens the camera's view by it, unit fidelity2: the eleven NTSC set-ups at 0.9);
   - film transparent (a Softimage picture has alpha 0 where nothing is hit);
   - view transform Standard, no look, no dither (the engine's pictures are display values);
-  - the world as a Softimage World node (ambience, fog, depth fade: switch, start, end, colour, transparency);
+  - the world as a Softimage World node (ambience, fog, depth fade: switch, start, end, colour, transparency; the
+    fade start may be negative, IK-PageTurn's is −2);
   - `si3d_back_culling`, and each material's Backface Culling from the set-up's BACK_CULLING;
   - the set-up's sub-region as the Render Region box, left unticked;
   - the set-up's MAX_RAY_DEPTH, GLOBAL_SWITCHES and ANTIALIAS as the engine's settings Ray depth, Materials, 2D textures, 3D textures, Reflection, Refraction, Shadows and Anti-aliasing (filter, level, threshold): blend2db writes them into the generated set-up instead of its own (depth 2, or 4 with a transparent material; all switches on; ADAPTIVE 2 2 0.05). Unit fidelity2: 154 corpus set-ups have depth 1 (no reflected rays; Thunderstorm's water reflected the island without it), 13 turn switches off, 191 differ in ANTIALIAS; with them carried dist-skull, DYNAMICS-Colorbars, INVKIN-Push, General-Skeleton and Shock3D-Bullet render pixel for pixel as the scene does;

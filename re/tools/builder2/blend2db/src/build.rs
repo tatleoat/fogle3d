@@ -8,13 +8,16 @@
 //! - World matrices are baked into the vertices; every object is a root model with an identity transform.
 //! - Colours: Blender's linear values are written sRGB-encoded (Softimage shades in display values).
 //! - Lights (unit builder2): colour, fall-off end and spot cone/spread are fitted per light against Cycles' own formulas (fit.rs);
-//!   shadow_type 2 (ray traced) when the light casts shadows; area lights are cosine-lobe spots. Ambience is fitted likewise.
+//!   shadow_type 2 (ray traced) when the light casts shadows, umbra 0 (unit soft1); area lights are cosine-lobe spots. A light
+//!   with a size (area, point or spot radius, sun angle) is an array of such lights over its shape (soft.rs, unit soft1).
+//!   Ambience is fitted likewise.
 //! - The set-up file (render options) is the template's, patched for the range, resolution, aspect, output name,
 //!   ambience and ray depth, and BACK_CULLING (ACTIVE when every material drawn has Backface Culling, unit finish1).
 //! - A light the Softimage importer made, unchanged since, keeps the scene's own colour, fall-off, cone, spread and umbra
 //!   (the "si" values export.py hands over; unit finish1) instead of the fit.
 use crate::construct::{flat_material, mesh_node, Corner, MeshData};
 use crate::anim;
+use crate::soft;
 use crate::fit::{self, Sample};
 use serde_json::Value;
 use si_elemio::{camera, light, Writer};
@@ -31,6 +34,12 @@ fn mat(v: &Value) -> M4 {
         }
     }
     m
+}
+
+/// A float32 sent as a short decimal (the add-on's `_short`): read back through f32 it is the same bits as the float32
+/// the add-on had (unit mem1); a long double (older exports) is rounded to f32 as well, which the later f32 casts did anyway.
+fn r32(x: f64) -> f64 {
+    x as f32 as f64
 }
 
 fn f3(v: &Value) -> [f64; 3] {
@@ -66,6 +75,42 @@ fn world_to_object(m: &M4) -> Option<([[f64; 3]; 3], [f64; 3])> {
     let t = conv([m[0][3], m[1][3], m[2][3]]);
     let b = [0, 1, 2].map(|i| -(am[i][0] * t[0] + am[i][1] * t[1] + am[i][2] * t[2]));
     Some((am, b))
+}
+
+/// A projected 2D texture of an object written in world space, put back in the object's own space
+/// (`simat::texture2d_object_space`, unit imp3); the report's line, or nothing.
+fn fold_projection(t2: &mut si_hrc::Texture2D, m: &M4, what: &str) -> String {
+    if !matches!(t2.method, 1 | 2 | 3 | 5 | 6) {
+        return String::new();
+    }
+    let Some((a, b)) = world_to_object(m) else {
+        return format!("texture {what}: projected in world space (the object's matrix has no inverse)\n");
+    };
+    match crate::simat::texture2d_object_space(t2, &a, &b) {
+        Some(true) => format!("texture {what}: projected in the object's space\n"),
+        Some(false) => format!("texture {what}: projected in world space (no exact form in the object's space)\n"),
+        None => String::new(),
+    }
+}
+
+/// Whether a later texture node of global scope with a projected method has an exact projection in the object's space,
+/// so it is written (unit imp3).
+fn projection_carried(si: &Value, m: &M4) -> bool {
+    let mut t2 = si_hrc::Texture2D::default();
+    crate::simat::apply_texture(&mut t2, si);
+    if !matches!(si["method"].as_i64(), Some(1 | 2 | 3 | 5 | 6)) {
+        return false;
+    }
+    world_to_object(m).is_some_and(|(a, b)| crate::simat::texture2d_object_space(&mut t2, &a, &b) != Some(false))
+}
+
+/// A camera's roll (radians): the angle from the level up (world Y) to the camera's up, about the view axis, from the
+/// view direction and the up in Softimage axes. The renderer turns the view by minus the roll (SI_camera: a positive roll
+/// turns the camera's up from the level up against the view axis; unit extra1, held against the program's own camera of
+/// CONSTRAINT-Camera_Object_Banking).
+fn camera_roll(fwd_s: [f64; 3], up_s: [f64; 3]) -> f64 {
+    let level = norm(add([0.0, 1.0, 0.0], fwd_s, -fwd_s[1]));
+    dot(cross(up_s, level), fwd_s).atan2(dot(level, up_s))
 }
 
 fn xform(m: &M4, p: [f64; 3]) -> [f64; 3] {
@@ -160,7 +205,14 @@ fn write_pic(raw: &str, to: &std::path::Path) -> Result<(), String> {
     std::fs::write(to, p.write(Some(b"blend2db"), false)).map_err(|e| format!("{to:?}: {e}"))
 }
 
-fn material_for(name: &str, m: Option<&Value>) -> si_hrc::Material {
+/// A Principled material whose colours come from gloss.rs `map` (unit gloss1): opaque, not emissive, no Softimage node.
+fn glossy(m: &Value) -> bool {
+    let alpha = m["alpha"].as_f64().unwrap_or(1.0).clamp(0.0, 1.0);
+    let trans = m["transmission"].as_f64().unwrap_or(0.0).clamp(0.0, 1.0);
+    m.get("si").filter(|s| s.is_object()).is_none() && 1.0 - alpha * (1.0 - trans) <= 0.0 && m["emission"].is_null()
+}
+
+fn material_for(name: &str, m: Option<&Value>, tune: &crate::gloss::Tune) -> si_hrc::Material {
     let Some(m) = m else {
         return flat_material(name, [0.5; 3], [0.7; 3], [0.0; 3], 50.0, 0.0, 0.0);
     };
@@ -183,6 +235,16 @@ fn material_for(name: &str, m: Option<&Value>) -> si_hrc::Material {
     let trans = m["transmission"].as_f64().unwrap_or(0.0).clamp(0.0, 1.0);
     let transp = 1.0 - alpha * (1.0 - trans);
     let mut mt = flat_material(name, diffuse, diffuse, spec, exponent, transp as f32, metal as f32);
+    // an opaque surface (unit gloss1): highlight size and brightness, metal tint and gloss calibrated against Cycles
+    // (gloss.rs); a transparent one (glass, alpha) keeps the mapping above
+    if glossy(m) {
+        let g = crate::gloss::map(m, tune);
+        mt = flat_material(name, g.diffuse, g.diffuse, g.specular, g.exponent, 0.0, g.reflectivity);
+    } else if trans > 0.0 && alpha >= 1.0 && m["emission"].is_null() {
+        if let Some((g, tr)) = crate::gloss::glass(m, tune) {
+            mt = flat_material(name, g.diffuse, g.diffuse, g.specular, g.exponent, tr, g.reflectivity);
+        }
+    }
     // an emissive Principled surface lights itself: constant shading in the emitted colour (the original has no emission
     // input; a constant-shaded model is the nearest self-lit surface)
     if let Some(e) = m["emission"].as_array() {
@@ -243,6 +305,81 @@ fn light_file(kind: i32, name: &str, colour: [f32; 3], pos: [f64; 3], interest: 
     light::write_file(&mut w, &l);
     w.out
 }
+
+/// The program's depth of field (camera mode 2) fitted to a Blender thin lens. The renderer blurs a sample with a radius of
+/// `half * o / oof` samples (cone filter, whole numbers), o being (near - d) * half in front of the sharp zone, 0 inside it and
+/// oof * (d - far) / (oof - far) behind it, held to `half`; `half` = (lines - 1) / 2 and lines = level * circle (odd, at least 5).
+/// Blender's circle of confusion (diameter in pixels) is aperture * f / (focus - f) * |d - focus| / d / pixel size; the fit
+/// picks `half` from the circle at a quarter of the focus distance (at most DOF_HALF_MAX) and then near, far and oof by least
+/// squares of the radius over distances from focus / 6 (not nearer than the clip) to 8 * focus. Linear ramps cannot follow the hyperbola
+/// of the near side exactly: an approximation. None when the blur would stay under half a sample.
+struct DofFit {
+    near: f64,
+    far: f64,
+    oof: f64,
+    circle: f64,
+    half: i32,
+}
+
+const DOF_HALF_MAX: i32 = 16;
+/// The cone filter spreads less than a lens disc of the same radius: the target radius is this times the disc's (measured, see the finding).
+const DOF_CONE: f64 = 1.0;
+
+fn dof_fit(lens_mm: f64, sensor_mm: f64, sensor_px: f64, focus: f64, fstop: f64, level: f64, clip0: f64) -> Option<DofFit> {
+    if !(focus > 0.0 && fstop > 0.0 && lens_mm > 0.0 && sensor_mm > 0.0 && sensor_px > 0.0) {
+        return None;
+    }
+    let f = lens_mm / 1000.0;
+    if focus <= 1.2 * f {
+        return None;
+    }
+    let px_m = sensor_mm / 1000.0 / sensor_px;
+    let c_inf = f / fstop * f / (focus - f) / px_m;
+    let rho = |d: f64| DOF_CONE * level * 0.5 * c_inf * (d - focus).abs() / d;
+    let d_lo = (focus / 6.0).max(clip0 * 1.5);
+    let d_hi = 8.0 * focus;
+    if d_lo >= focus {
+        return None;
+    }
+    let ref_rho = rho((focus / 4.0).max(d_lo));
+    if ref_rho.max(rho(d_hi)) < 0.5 {
+        return None;
+    }
+    let n = 48;
+    let ds: Vec<f64> = (0..n).map(|i| d_lo * (d_hi / d_lo).powf(i as f64 / (n - 1) as f64)).collect();
+    let g = 36;
+    // (error, half, near, far, oof): `half` too is searched, from a third of the reference radius to the cap, the error carrying a
+    // small cost per sample of half (the blur costs lines squared per pixel)
+    let mut best = (f64::MAX, 1, focus, focus, 4.0 * focus);
+    let lo_half = ((ref_rho / 3.0).ceil() as i32).clamp(1, DOF_HALF_MAX);
+    let hi_half = (ref_rho.ceil() as i32).clamp(lo_half, DOF_HALF_MAX);
+    for half in lo_half..=hi_half {
+        let hf = half as f64;
+        let target: Vec<f64> = ds.iter().map(|&d| rho(d).min(DOF_HALF_MAX as f64)).collect();
+        let radius = |d: f64, zn: f64, zf: f64, oof: f64| -> f64 {
+            let o = if d < zn { ((zn - d) * hf).min(oof) } else if d <= zf { 0.0 } else if d < oof { oof * (d - zf) / (oof - zf) } else { oof };
+            (hf * o / oof).floor()
+        };
+        for i in 0..g {
+            let zn = focus * (0.35 + 0.65 * i as f64 / (g - 1) as f64);
+            for j in 0..g {
+                let zf = focus * (1.0 + 2.0 * j as f64 / (g - 1) as f64);
+                for k in 0..g {
+                    let oof = zf * (1.05 + 40.0 * (k as f64 / (g - 1) as f64).powi(2));
+                    let e: f64 = ds.iter().zip(&target).map(|(&d, &t)| (radius(d, zn, zf, oof) - t).powi(2)).sum::<f64>() + 0.05 * hf * hf;
+                    if e < best.0 {
+                        best = (e, half, zn, zf, oof);
+                    }
+                }
+            }
+        }
+    }
+    let (_, half, near, far, oof) = best;
+    // lines = trunc(level * circle) must come to 2 * half + 1 (a hair over, for the float rounding)
+    let circle = ((2 * half + 1) as f64 + 0.01) / level;
+    Some(DofFit { near, far, oof, circle, half })
+}
+
 
 fn patch_setup(template: &str, first: i32, last: i32, w: i64, h: i64, ambience: [f32; 3], out_name: &str, ray_depth: i32, back_culling: bool, extra: &[(String, String)]) -> String {
     let mut o = String::new();
@@ -348,10 +485,11 @@ fn build(json: &str, out: &str, tdb: &str, tscene: &str, rsrc: &str) -> Result<S
     let (mut cull_on, mut cull_off) = (0usize, Vec::<String>::new()); // materials drawn with and without Backface Culling
     let mut skipped_notes: Vec<String> = sc["skipped"].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(String::from)).collect();
     let mut model_src: Vec<String> = Vec::new(); // the Blender object each model comes from (light linking)
+    let tune = crate::gloss::tune();
     for ob in sc["objects"].as_array().into_iter().flatten() {
         let oname = clean(ob["name"].as_str().unwrap_or("obj"), &mut names);
         let m = mat(&ob["matrix_world"]);
-        let verts: Vec<[f32; 3]> = ob["verts"].as_array().into_iter().flatten().map(|v| f32x3(conv(xform(&m, f3(v))))).collect();
+        let verts: Vec<[f32; 3]> = ob["verts"].as_array().into_iter().flatten().map(|v| f32x3(conv(xform(&m, f3(v).map(r32))))).collect();
         let tris: Vec<Vec<usize>> = match ob["tris"].as_array() {
             Some(t) => t.iter().map(|x| x.as_array().map(|a| a.iter().map(|i| i.as_u64().unwrap_or(0) as usize).collect()).unwrap_or_default()).collect(),
             None => {
@@ -370,6 +508,12 @@ fn build(json: &str, out: &str, tdb: &str, tscene: &str, rsrc: &str) -> Result<S
         let polys_mat: Vec<i64> = ob["poly_material"].as_array().map(|a| a.iter().map(|i| i.as_i64().unwrap_or(0)).collect()).unwrap_or_default();
         let tri_normals = ob["tri_normals"].as_array();
         let tri_uv = ob["tri_uv"].as_array();
+        // the compact form (unit mem1): a table of distinct (normal, UV) corners (vertex i's own is entry i), and the triangle
+        // corners that use another entry (corner_x: triangle * 3 + corner -> entry)
+        let compact = ob["corner_normals"].is_array();
+        let corner_x: std::collections::HashMap<usize, usize> = ob["corner_x"].as_array().into_iter().flatten().filter_map(|x| Some((x.get(0)?.as_u64()? as usize, x.get(1)?.as_u64()? as usize))).collect();
+        let corner_n = ob["corner_normals"].as_array();
+        let corner_uv = ob["corner_uv"].as_array();
         if verts.is_empty() || tris.is_empty() {
             skipped_notes.push(format!("{oname} (no triangles)"));
             continue;
@@ -386,14 +530,16 @@ fn build(json: &str, out: &str, tdb: &str, tscene: &str, rsrc: &str) -> Result<S
             let fnrm = norm(cross(add(p[1], p[0], -1.0), add(p[2], p[0], -1.0)));
             let mut cs = Vec::new();
             for k in 0..3 {
-                let n = tri_normals
-                    .and_then(|a| a.get(ti))
-                    .and_then(|a| a.get(k))
-                    .map(|v| conv(xnormal(&m, f3(v))))
-                    .unwrap_or(fnrm);
-                let uv = tri_uv
-                    .and_then(|a| a.get(ti))
-                    .and_then(|a| a.get(k))
+                let ci = if compact { Some(corner_x.get(&(ti * 3 + k)).copied().unwrap_or(t[k])) } else { None };
+                let n = match ci {
+                    Some(c) => corner_n.and_then(|a| a.get(c)).map(|v| conv(xnormal(&m, f3(v).map(r32)))),
+                    None => tri_normals.and_then(|a| a.get(ti)).and_then(|a| a.get(k)).map(|v| conv(xnormal(&m, f3(v)))),
+                }
+                .unwrap_or(fnrm);
+                let uv = match ci {
+                    Some(c) => corner_uv.and_then(|a| a.get(c)),
+                    None => tri_uv.and_then(|a| a.get(ti)).and_then(|a| a.get(k)),
+                }
                     .and_then(Value::as_array)
                     .map(|a| [a.first().and_then(Value::as_f64).unwrap_or(0.0) as f32, a.get(1).and_then(Value::as_f64).unwrap_or(0.0) as f32])
                     .unwrap_or([0.0; 2]);
@@ -429,7 +575,7 @@ fn build(json: &str, out: &str, tdb: &str, tscene: &str, rsrc: &str) -> Result<S
         for &u in &used {
             let bm = slots.get(u as usize).copied().flatten().and_then(|n| sc["materials"].get(n));
             let mname = format!("mat{}", mat_elems.len() + 1);
-            mats.push(material_for(&mname, bm));
+            mats.push(material_for(&mname, bm, &tune));
             std::fs::write(dir("MATERIALS")?.join(format!("{prefix}-{mname}.1-0.mtr")), si_hrc::write_material(mats.last().unwrap(), si_file::VERSION_OUTPUT)).map_err(|e| e.to_string())?;
             remap.insert(u, mats.len() as i16 - 1);
             model_mats.push((mi, mat_elems.len()));
@@ -459,6 +605,7 @@ fn build(json: &str, out: &str, tdb: &str, tscene: &str, rsrc: &str) -> Result<S
                     t2.name = tex_pics[pic].as_bytes().to_vec();
                     t2.filename = format!("t2d{tn}").into_bytes();
                     crate::simat::apply_texture(&mut t2, &t["si"]);
+                    report += &fold_projection(&mut t2, &m, &format!("t2d{tn} of {oname}"));
                     let el = format!("{prefix}-t2d{tn}.1-0");
                     std::fs::write(dir("TEXTURES2D")?.join(format!("{el}.txt")), si_hrc::write_texture(&t2, si_file::VERSION_OUTPUT)).map_err(|e| e.to_string())?;
                     mat_tex.push((me, tex_elems.len()));
@@ -490,7 +637,7 @@ fn build(json: &str, out: &str, tdb: &str, tscene: &str, rsrc: &str) -> Result<S
         }
         if mats.is_empty() {
             let mname = format!("mat{}", mat_elems.len() + 1);
-            mats.push(material_for(&mname, None));
+            mats.push(material_for(&mname, None, &tune));
             std::fs::write(dir("MATERIALS")?.join(format!("{prefix}-{mname}.1-0.mtr")), si_hrc::write_material(mats.last().unwrap(), si_file::VERSION_OUTPUT)).map_err(|e| e.to_string())?;
             model_mats.push((mi, mat_elems.len()));
             mat_elems.push(format!("{prefix}-{mname}.1-0"));
@@ -504,13 +651,15 @@ fn build(json: &str, out: &str, tdb: &str, tscene: &str, rsrc: &str) -> Result<S
         // that material's later Softimage Texture nodes of global scope with the UV method, which read the same
         // corner UVs (the importer makes a later projected texture UV only when its coordinates are the first's;
         // unit extra2: Torch_Fire's flame grid, flamme and its textured shadow fire_shade2)
+        // and a later projected one whose projection has an exact form in the object's space (unit imp3: Sand_Gust's and
+        // Missile's terrain, the third texture, marbre4 turned half round; it was left out)
         let texs: Vec<Value> = used
             .iter()
             .find_map(|&u| {
                 let bm = slots.get(u as usize).copied().flatten().and_then(|n| sc["materials"].get(n))?;
                 let all: Vec<&Value> = bm["textures"].as_array()?.iter().filter(|t| t["raw"].is_string()).collect();
                 let first = (*all.first()?).clone();
-                Some(std::iter::once(first).chain(all[1..].iter().filter(|t| t["si"]["method"].as_i64() == Some(4)).map(|t| (*t).clone())).collect())
+                Some(std::iter::once(first).chain(all[1..].iter().filter(|t| t["si"]["method"].as_i64() == Some(4) || projection_carried(&t["si"], &m)).map(|t| (*t).clone())).collect())
             })
             .unwrap_or_default();
         for t in texs {
@@ -537,6 +686,7 @@ fn build(json: &str, out: &str, tdb: &str, tscene: &str, rsrc: &str) -> Result<S
             if let Some(p) = t.get("si") {
                 crate::simat::apply_texture(&mut t2, p);
             }
+            report += &fold_projection(&mut t2, &m, &format!("t2d{tn} of {oname}"));
             let el = format!("{prefix}-t2d{tn}.1-0");
             std::fs::write(dir("TEXTURES2D")?.join(format!("{el}.txt")), si_hrc::write_texture(&t2, si_file::VERSION_OUTPUT)).map_err(|e| e.to_string())?;
             model_tex.push((mi, tex_elems.len()));
@@ -629,7 +779,17 @@ fn build(json: &str, out: &str, tdb: &str, tscene: &str, rsrc: &str) -> Result<S
     if let Some(fr) = anim {
         for (mi, src) in mat_src.iter().enumerate() {
             let Some(src) = src else { continue };
-            let vals: Vec<Option<[f32; 3]>> = fr.iter().map(|f| f["materials"].get(src.as_str()).filter(|v| v.is_array()).map(|v| col(&Value::Array(v.as_array().unwrap().iter().take(3).cloned().collect())))).collect();
+            // a glossy material's diffuse colour is gloss.rs's for the frame's base colour (a metal's is not the base colour)
+            let gm = sc["materials"].get(src.as_str()).filter(|m| glossy(m));
+            let frame_col = |v: &Value| match gm {
+                Some(m) => {
+                    let mut m = m.clone();
+                    m["diffuse"] = v.clone();
+                    crate::gloss::map(&m, &tune).diffuse
+                }
+                None => col(&Value::Array(v.as_array().unwrap().iter().take(3).cloned().collect())),
+            };
+            let vals: Vec<Option<[f32; 3]>> = fr.iter().map(|f| f["materials"].get(src.as_str()).filter(|v| v.is_array()).map(frame_col)).collect();
             if vals.iter().all(Option::is_some) {
                 let mut c = [vec![], vec![], vec![]];
                 for v in vals.iter().flatten() {
@@ -668,11 +828,7 @@ fn build(json: &str, out: &str, tdb: &str, tscene: &str, rsrc: &str) -> Result<S
         let pos_s = add(pos_s, fwd_s, -back);
         let dist = 10.0;
         let int_s = add(pos_s, fwd_s, dist);
-        // roll: the angle from the level up (world Y) to the camera's up, about the view axis
-        let level = norm(add([0.0, 1.0, 0.0], fwd_s, -fwd_s[1]));
-        // (the renderer turns the view by minus the roll, SI_camera: a positive roll turns the camera's up from the level
-        // up against the view axis; unit extra1, held against the program's own camera of CONSTRAINT-Camera_Object_Banking)
-        let roll = dot(cross(up_s, level), fwd_s).atan2(dot(level, up_s));
+        let roll = camera_roll(fwd_s, up_s);
         let aspect = w as f64 / h as f64;
         let lens = c["lens"].as_f64().unwrap_or(50.0);
         let sensor = c["sensor"].as_f64().unwrap_or(36.0);
@@ -690,24 +846,24 @@ fn build(json: &str, out: &str, tdb: &str, tscene: &str, rsrc: &str) -> Result<S
         let ph = 2.0 * 50.0 * (fov_v / 2.0).tan();
         cam.proj_plane_size = [(ph * aspect) as f32, ph as f32];
         cam.proj_plane_distance = 50.0;
-        // depth of field: the program's custom mode (2) with the zone and blur of Blender's thin lens: the near and far limits are
-        // where the blur circle is half a pixel; the blur is the circle at four times the focus distance, in pixels
+        // depth of field: the program's custom mode (2), the zone and blur fitted to Blender's thin lens (fn dof_fit)
         if let (Some(focus), Some(fstop)) = (c["dof"]["focus"].as_f64(), c["dof"]["fstop"].as_f64()) {
-            if !ortho && focus > 0.0 && fstop > 0.0 {
-                let f = lens / 1000.0;
-                let aperture = f / fstop;
-                let sensor_m = sensor / 1000.0;
-                let px_m = sensor_m / (if aspect >= 1.0 { w as f64 } else { h as f64 });
-                let k = 0.5 * px_m * (focus - f) / (aperture * f);
-                let coc_px = |d: f64| aperture * f / (focus - f) * (d - focus).abs() / d / px_m;
-                let oof = 4.0 * focus;
-                cam.depth_of_field = 2;
-                cam.near_focus = (focus / (1.0 + k)) as f32;
-                cam.far_focus = if k < 1.0 { (focus / (1.0 - k)).min(30000.0) as f32 } else { 30000.0 };
-                cam.out_of_focus = oof as f32;
-                cam.maximum_coc = coc_px(oof).clamp(1.0, 40.0) as f32;
-                cam.focal_distance = focus as f32;
-                skipped_notes.push(format!("depth of field: custom zone {:.2} to {:.2}, blur {:.1} pixels at {:.1}", cam.near_focus, cam.far_focus, cam.maximum_coc, oof));
+            if !ortho {
+                // the renderer's sampling level (measured: 1 with ANTIALIAS ADAPTIVE, the level word with FIXED; the blur's
+                // radius is counted in samples, pixels times the level)
+                let aa: Vec<&str> = sc["render"]["setup"]["ANTIALIAS"].as_str().unwrap_or("ADAPTIVE").split_whitespace().collect();
+                let level = if aa.first() == Some(&"FIXED") { aa.get(2).and_then(|t| t.parse::<f64>().ok()).unwrap_or(1.0).max(1.0) } else { 1.0 };
+                let sensor_px = if aspect >= 1.0 { w as f64 } else { h as f64 };
+                let clip0 = clip.first().and_then(Value::as_f64).unwrap_or(0.1);
+                if let Some(d) = dof_fit(lens, sensor, sensor_px, focus, fstop, level, clip0) {
+                    cam.depth_of_field = 2;
+                    cam.near_focus = d.near as f32;
+                    cam.far_focus = d.far as f32;
+                    cam.out_of_focus = d.oof as f32;
+                    cam.maximum_coc = d.circle as f32;
+                    cam.focal_distance = focus as f32;
+                    skipped_notes.push(format!("depth of field: approximated, sharp zone {:.2} to {:.2}, blur up to {} samples (level {}), linear ramps to {:.1} (the program's blur has no true lens)", d.near, d.far, d.half, level, d.oof));
+                }
             }
         } else if let (Some(mode), Some(v)) = (c["si_dof"]["mode"].as_i64(), c["si_dof"]["values"].as_array()) {
             // an imported scene's own depth of field (the importer keeps it on the camera): its mode and the seven values
@@ -741,6 +897,18 @@ fn build(json: &str, out: &str, tdb: &str, tscene: &str, rsrc: &str) -> Result<S
             }
             let mut curves = anim::group([142, 143, 144], p);
             curves.extend(anim::group([145, 146, 147], i));
+            // the roll (curve type 11, relation 1130 CamRoll, degrees), unwrapped so that keys never jump by a turn (unit imp3)
+            let mut roll: Vec<f64> = Vec::new();
+            for m in ms.iter().flatten() {
+                let r = camera_roll(conv(norm([-m[0][2], -m[1][2], -m[2][2]])), conv(norm([m[0][1], m[1][1], m[2][1]]))).to_degrees();
+                roll.push(match roll.last() {
+                    Some(&q) => r + 360.0 * ((q - r) / 360.0).round(),
+                    None => r,
+                });
+            }
+            if roll.len() > 1 && roll.iter().any(|r| (r - roll[0]).abs() > 1e-6 * (1.0 + roll[0].abs())) {
+                curves.push(anim::Curve { ty: 11, vals: roll });
+            }
             // lens animation: the field of view (curve type 12, degrees, vertical like the camera file's) per frame; the picture's
             // aspect and the sensor are the still's
             let lens_f: Vec<f64> = fr.iter().map(|f| f["camera"]["lens"].as_f64().unwrap_or(0.0)).collect();
@@ -776,6 +944,11 @@ fn build(json: &str, out: &str, tdb: &str, tscene: &str, rsrc: &str) -> Result<S
     let mut nl = 0;
     let wcol = if sc["world"].is_null() { [0.0; 3] } else { f3(&sc["world"]) };
     let amb_fit = fit::fit_ambient(wcol, &samples, cam_pos);
+    // soft shadows (unit soft1, soft.rs): a light's size is measured from the scene's middle (the mean of the triangles'
+    // centres), and a point light's array faces it; the add-on's Soft shadow lights caps the lights per light
+    let centre = if samples.is_empty() { None } else { Some(samples.iter().fold([0.0; 3], |c, s| add(c, s.p, 1.0 / samples.len() as f64))) };
+    let soft_max = sc["render"]["soft_lights"].as_u64().map_or(soft::DEFAULT_MAX, |v| v.min(256) as usize);
+    let mut soft_names: Vec<String> = Vec::new(); // the arrays' lights, for soft-arrays.txt (unit softspeed1)
     for l in sc["lights"].as_array().into_iter().flatten() {
         nl += 1;
         let m = mat(&l["matrix_world"]);
@@ -816,8 +989,65 @@ fn build(json: &str, out: &str, tdb: &str, tscene: &str, rsrc: &str) -> Result<S
             None => (fit.start as f32, fit.end as f32),
         };
         let (cone, spread) = if si.is_some() && kind_s == "SPOT" { (si_f("cone", cone), si_f("spread", spread)) } else { (cone, spread) };
-        // the scene's umbra (SHADOW_FACTOR, +0x90); None keeps the record's default 0.75
-        let umbra = si.and_then(|s| s["umbra"].as_f64()).map(|u| u as f32);
+        // the umbra (SHADOW_FACTOR, +0x90: the factor left on the light where it is in shadow): an imported light keeps
+        // its scene's (None: the record's default 0.75); a Blender light's shadow takes all of its light, as Cycles' does
+        // (unit soft1: with 0.75 the core of a shadow was 0.19 dark against Cycles' 0.85, re/tools/soft1)
+        let umbra = match si {
+            Some(s) => s["umbra"].as_f64().map(|u| u as f32),
+            None => Some(0.0),
+        };
+        // soft shadows (unit soft1, soft.rs): a Blender light with a size becomes n lights over its
+        // shape (area light: its square, rectangle, disc or ellipse; point light: a disc of its radius facing the scene's
+        // middle; spot: a disc of its radius across its axis; sun: directions over its angle), each with 1/n of the
+        // fitted colour and ray-traced shadows. n follows the angular size seen from the scene's middle, up to the
+        // add-on's Soft shadow lights, with the shadow on or off (the switch must not move the light); n = 1 (no size, an
+        // imported light, the setting 1) writes the one light as before.
+        let area_shape = l["area_shape"].as_str().unwrap_or("SQUARE");
+        let (ax, ay) = {
+            let a = f3(&l["area_size"]);
+            if matches!(area_shape, "RECTANGLE" | "ELLIPSE") { (a[0], a[1]) } else { (a[0], a[0]) }
+        };
+        let round = kind_s != "AREA" || matches!(area_shape, "DISK" | "ELLIPSE");
+        let radius = l["radius"].as_f64().unwrap_or(0.0).max(0.0);
+        let angle = l["angle"].as_f64().unwrap_or(0.0).clamp(0.0, 3.0);
+        let mid = centre.unwrap_or(add(pos, fwd, 10.0));
+        let d = {
+            let v = add(mid, pos, -1.0);
+            dot(v, v).sqrt().max(1e-9)
+        };
+        let axis_len = |j: usize| (m[0][j] * m[0][j] + m[1][j] * m[1][j] + m[2][j] * m[2][j]).sqrt();
+        let alpha = match kind_s {
+            "AREA" => 2.0 * ((ax * axis_len(0)).max(ay * axis_len(1)) / 2.0 / d).atan(),
+            "SUN" => angle,
+            _ => 2.0 * (radius / d).atan(),
+        };
+        let n = if si.is_some() { 1 } else { soft::count(alpha, soft_max) };
+        let pts = if n == 1 { vec![[0.0; 2]] } else if round { soft::disc(n) } else { soft::square(n) };
+        // where light q of the array stands and where it points, for a frame's matrix of the Blender light
+        let place = |m: &M4, q: [f64; 2]| -> ([f64; 3], [f64; 3]) {
+            let p0 = conv(xform(m, [0.0; 3]));
+            let fw = conv(norm([-m[0][2], -m[1][2], -m[2][2]]));
+            if n == 1 {
+                return (p0, fw);
+            }
+            match kind_s {
+                "AREA" => {
+                    let (hx, hy) = if round { (ax / 2.0, ay / 2.0) } else { (ax, ay) };
+                    (conv(xform(m, [q[0] * hx, q[1] * hy, 0.0])), fw)
+                }
+                "SUN" => {
+                    let (e1, e2) = soft::basis(fw);
+                    let t = (angle / 2.0).tan();
+                    (p0, norm(add(add(fw, e1, t * q[0]), e2, t * q[1])))
+                }
+                _ => {
+                    let axis = if kind_s == "SPOT" { fw } else { norm(add(mid, p0, -1.0)) };
+                    let (e1, e2) = soft::basis(axis);
+                    (add(add(p0, e1, radius * q[0]), e2, radius * q[1]), fw)
+                }
+            }
+        };
+        let part = |c: [f32; 3]| if n == 1 { c } else { c.map(|v| v / n as f32) };
         if si.is_some() {
             let kind_of = si.and_then(|s| s["shadow"].as_i64()).map_or(String::new(), |k| format!(", shadow kind {k}"));
             report += &format!("light {} {kind_s}: the Softimage scene's own values (imported, unchanged), colour {:.3} {:.3} {:.3} fall-off {} {}{kind_of}\n", l["name"].as_str().unwrap_or("?"), colour[0], colour[1], colour[2], fs, fe);
@@ -833,50 +1063,72 @@ fn build(json: &str, out: &str, tdb: &str, tscene: &str, rsrc: &str) -> Result<S
             (None, Some(names)) => Some((0, names)),
             _ => None,
         };
+        let mut sel_hit: Vec<usize> = Vec::new();
         let sel = sel.map(|(v, names)| {
             let want: std::collections::BTreeSet<&str> = names.iter().filter_map(|n| n.as_str()).collect();
             let hit: Vec<usize> = (0..models.len()).filter(|&i| want.contains(model_src[i].as_str())).collect();
             report += &format!("light {}: selective, {} {} model(s)\n", l["name"].as_str().unwrap_or("?"), if v == 1 { "lights only" } else { "lights all but" }, hit.len());
-            light_models.extend(hit.into_iter().map(|i| (root_at, i)));
+            sel_hit = hit;
             v
         });
-        match kind_s {
-            "SUN" => {
-                let el = format!("{prefix}-inf{nl}.1-0");
-                // an infinite light has no place: its position field is the direction towards the light, from the origin; the interest is not read (finding 0012, si_lights step 1)
-                let dir_to = [-fwd[0] * 100.0, -fwd[1] * 100.0, -fwd[2] * 100.0];
-                let b = light_file(3, &format!("inf{nl}"), colour, dir_to, add(dir_to, fwd, 10.0), 0.5236, 0.0873, (fs, fe), shadow, None, umbra, sel, si);
-                std::fs::write(dir("LIGHTS")?.join(format!("{el}.lig")), b).map_err(|e| e.to_string())?;
-                light_roots.push(el);
+        if n > 1 {
+            report += &format!("light {}: soft shadow, {n} lights over {:.2} degrees\n", l["name"].as_str().unwrap_or("?"), alpha.to_degrees());
+        }
+        // the array's lights are named after the light with x1, x2, ... (n = 1: the name as before)
+        for (j, &q) in pts.iter().enumerate() {
+            let (pos, fwd) = place(&m, q);
+            let tag = if n == 1 { String::new() } else { format!("x{}", j + 1) };
+            if n > 1 {
+                let base = match kind_s {
+                    "SUN" => "inf",
+                    "SPOT" | "AREA" => "spot",
+                    _ => "light",
+                };
+                // the record's name as light_file writes it (29 bytes at most)
+                let full = format!("{base}{nl}{tag}");
+                soft_names.push(full[..full.len().min(29)].to_string());
             }
-            "SPOT" | "AREA" => {
-                // a spot is two elements: the light (inside the interest's file) and its interest (root)
-                let (cone, spread) = if kind_s == "AREA" { (0.0, std::f64::consts::PI) } else { (cone, spread) };
-                let el = format!("{prefix}-spot{nl}_int.1-0");
-                // soft depth-map shadows (shadow type 4) were tried for area lights: a faint blur, rmse no better than ray traced
-                // shadows (unit blender3, re/out/lead/blender/matrix.md), so area lights keep type 2
-                let soft = None;
-                let b = light_file(2, &format!("spot{nl}"), colour, pos, add(pos, fwd, 10.0), cone as f32, spread as f32, (fs, fe), shadow, soft, umbra, sel, si);
-                std::fs::write(dir("LIGHTS")?.join(format!("{el}.lig")), b).map_err(|e| e.to_string())?;
-                light_roots.push(el);
-                light_other.push(format!("{prefix}-spot{nl}.1-0"));
-                light_rel.push((light_roots.len() - 1, light_other.len() - 1));
-                if kind_s == "AREA" {
-                    skipped_notes.push(format!("area light {}: rendered as a cosine-lobe spot light (no area shape, no soft shadows)", l["name"].as_str().unwrap_or("?")));
+            let colour = part(colour);
+            match kind_s {
+                "SUN" => {
+                    let el = format!("{prefix}-inf{nl}{tag}.1-0");
+                    // an infinite light has no place: its position field is the direction towards the light, from the origin; the interest is not read (finding 0012, si_lights step 1)
+                    let dir_to = [-fwd[0] * 100.0, -fwd[1] * 100.0, -fwd[2] * 100.0];
+                    let b = light_file(3, &format!("inf{nl}{tag}"), colour, dir_to, add(dir_to, fwd, 10.0), 0.5236, 0.0873, (fs, fe), shadow, None, umbra, sel, si);
+                    std::fs::write(dir("LIGHTS")?.join(format!("{el}.lig")), b).map_err(|e| e.to_string())?;
+                    light_roots.push(el);
+                }
+                "SPOT" | "AREA" => {
+                    // a spot is two elements: the light (inside the interest's file) and its interest (root)
+                    let (cone, spread) = if kind_s == "AREA" { (0.0, std::f64::consts::PI) } else { (cone, spread) };
+                    let el = format!("{prefix}-spot{nl}{tag}_int.1-0");
+                    // soft depth-map shadows (shadow type 4) were tried for area lights: a faint blur, rmse no better than ray traced
+                    // shadows (unit blender3, re/out/lead/blender/matrix.md): the renderer's filter softens a fixed number of map
+                    // cells inside the hard edge only, so soft shadows come from the array above (unit soft1)
+                    let b = light_file(2, &format!("spot{nl}{tag}"), colour, pos, add(pos, fwd, 10.0), cone as f32, spread as f32, (fs, fe), shadow, None, umbra, sel, si);
+                    std::fs::write(dir("LIGHTS")?.join(format!("{el}.lig")), b).map_err(|e| e.to_string())?;
+                    light_roots.push(el);
+                    light_other.push(format!("{prefix}-spot{nl}{tag}.1-0"));
+                    light_rel.push((light_roots.len() - 1, light_other.len() - 1));
+                }
+                _ => {
+                    let el = format!("{prefix}-light{nl}{tag}.1-0");
+                    let b = light_file(1, &format!("light{nl}{tag}"), colour, pos, [0.0; 3], 0.5236, 0.0873, (fs, fe), shadow, None, umbra, sel, si);
+                    std::fs::write(dir("LIGHTS")?.join(format!("{el}.lig")), b).map_err(|e| e.to_string())?;
+                    light_roots.push(el);
                 }
             }
-            _ => {
-                let el = format!("{prefix}-light{nl}.1-0");
-                let b = light_file(1, &format!("light{nl}"), colour, pos, [0.0; 3], 0.5236, 0.0873, (fs, fe), shadow, None, umbra, sel, si);
-                std::fs::write(dir("LIGHTS")?.join(format!("{el}.lig")), b).map_err(|e| e.to_string())?;
-                light_roots.push(el);
-            }
+        }
+        for r in root_at..light_roots.len() {
+            light_models.extend(sel_hit.iter().map(|&i| (r, i)));
+        }
+        if kind_s == "AREA" && n == 1 && shadow && alpha >= soft::MIN_ANGLE {
+            skipped_notes.push(format!("area light {}: rendered as one cosine-lobe spot light (Soft shadow lights 1: no area shape, hard shadows)", l["name"].as_str().unwrap_or("?")));
         }
         // motion: position (a sun's is its direction), a spot's interest, and the colour scaled by the energy and colour change
         if let Some(fr) = anim {
             let ls: Vec<Option<&Value>> = fr.iter().map(|f| f["lights"].get(l["name"].as_str().unwrap_or("")).filter(|v| !v.is_null())).collect();
             if ls.iter().all(Option::is_some) && root_at < light_roots.len() {
-                let (mut p, mut i, mut c, mut fe_v) = ([vec![], vec![], vec![]], [vec![], vec![], vec![]], [vec![], vec![], vec![]], vec![]);
                 // fit_light is a function of (colour, energy, position, direction) here (samples, camera, world and ambience are
                 // the still's): a frame whose light has the same bits as the last one fitted takes that fit again. A 250-frame
                 // range with a still light refitted over 16,000 triangles each frame took 0.12 s of blend2db's 0.22 s (unit speed2).
@@ -885,11 +1137,12 @@ fn build(json: &str, out: &str, tdb: &str, tscene: &str, rsrc: &str) -> Result<S
                     v.map(f64::to_bits)
                 };
                 let mut last = (key(lcol, energy, pos, fwd), fit.colour, fit.end);
+                // each frame's matrix, colour and fall-off end; then the curves of each light of the array (n = 1: the one light)
+                let mut per_frame: Vec<(M4, [f64; 3], f64)> = Vec::new();
                 for lf in ls.iter().flatten() {
                     let m = mat(&lf["matrix_world"]);
                     let ps = conv(xform(&m, [0.0; 3]));
                     let fw = conv(norm([-m[0][2], -m[1][2], -m[2][2]]));
-                    let (pp, ii) = if kind_s == "SUN" { ([-fw[0] * 100.0, -fw[1] * 100.0, -fw[2] * 100.0], [0.0; 3]) } else { (ps, add(ps, fw, 10.0)) };
                     let e = lf["energy"].as_f64().unwrap_or(energy);
                     // colour and fall-off end are fitted again for the frame's light (on the still's geometry)
                     let lc = f3(&lf["color"]);
@@ -904,25 +1157,34 @@ fn build(json: &str, out: &str, tdb: &str, tscene: &str, rsrc: &str) -> Result<S
                         Some(s) => (f3(&s["color"]), s["falloff_end"].as_f64().unwrap_or(10000.0)),
                         None => (last.1, last.2),
                     };
-                    for k in 0..3 {
-                        p[k].push(pp[k]);
-                        i[k].push(ii[k]);
-                        c[k].push(cc[k]);
+                    per_frame.push((m, cc, ee));
+                }
+                for (j, &q) in pts.iter().enumerate() {
+                    let (mut p, mut i, mut c, mut fe_v) = ([vec![], vec![], vec![]], [vec![], vec![], vec![]], [vec![], vec![], vec![]], vec![]);
+                    for (m, cc, ee) in &per_frame {
+                        let (ps, fw) = place(m, q);
+                        let (pp, ii) = if kind_s == "SUN" { ([-fw[0] * 100.0, -fw[1] * 100.0, -fw[2] * 100.0], [0.0; 3]) } else { (ps, add(ps, fw, 10.0)) };
+                        let cc = if n == 1 { *cc } else { cc.map(|v| v / n as f64) };
+                        for k in 0..3 {
+                            p[k].push(pp[k]);
+                            i[k].push(ii[k]);
+                            c[k].push(cc[k]);
+                        }
+                        fe_v.push(*ee);
                     }
-                    fe_v.push(ee);
-                }
-                let mut curves = anim::group([22, 23, 24], c);
-                curves.extend(anim::group([148, 149, 150], p));
-                if kind_s != "SUN" && kind_s != "POINT" {
-                    curves.extend(anim::group([151, 152, 153], i));
-                }
-                if fe_v.iter().any(|x| (x - fe_v[0]).abs() > 1e-6 * (1.0 + fe_v[0].abs())) {
-                    curves.push(anim::Curve { ty: 29, vals: fe_v });
-                }
-                if !curves.is_empty() {
-                    let root = &light_roots[root_at];
-                    anim_rel.push(("LIGHTS", root_at, anim_files.len(), 15008));
-                    anim_files.push((format!("{}Lig", root.trim_end_matches(".1-0")) + ".1-0", anim::ani_file("LIGHTS", root, &curves, &frame_nums, fps)));
+                    let mut curves = anim::group([22, 23, 24], c);
+                    curves.extend(anim::group([148, 149, 150], p));
+                    if kind_s != "SUN" && kind_s != "POINT" {
+                        curves.extend(anim::group([151, 152, 153], i));
+                    }
+                    if fe_v.iter().any(|x| (x - fe_v[0]).abs() > 1e-6 * (1.0 + fe_v[0].abs())) {
+                        curves.push(anim::Curve { ty: 29, vals: fe_v });
+                    }
+                    if !curves.is_empty() {
+                        let root = &light_roots[root_at + j];
+                        anim_rel.push(("LIGHTS", root_at + j, anim_files.len(), 15008));
+                        anim_files.push((format!("{}Lig", root.trim_end_matches(".1-0")) + ".1-0", anim::ani_file("LIGHTS", root, &curves, &frame_nums, fps)));
+                    }
                 }
             }
         }
@@ -937,6 +1199,13 @@ fn build(json: &str, out: &str, tdb: &str, tscene: &str, rsrc: &str) -> Result<S
         skipped_notes.push("no light in the scene: a black light stands in for the program's default light".into());
     }
     report += &format!("lights {}\n", light_roots.len());
+    // the lights of the soft shadows' arrays, one name a line, beside the database (not in it: the original never
+    // reads it). render-frames answers their shadow rays in doubles where that is certain (unit softspeed1,
+    // crates/si-render/src/softarray.rs); without the file (every Softimage database) nothing changes.
+    if !soft_names.is_empty() {
+        let f = out.join("soft-arrays.txt");
+        std::fs::write(&f, soft_names.join("\n") + "\n").map_err(|e| format!("{f:?}: {e}"))?;
+    }
 
     // ---- scene description (text in the corpus's form, read back by the dsc reader as a check)
     let mut t = String::from("SDSC3.704\nELEMENTS \n");

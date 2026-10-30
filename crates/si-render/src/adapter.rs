@@ -814,6 +814,8 @@ pub fn build_scene<'f>(p: &mut Prepared, files: &'f mut dyn PictureFiles, m: &Me
     p.st.light_head = (l != 0).then_some(0);
     while l != 0 {
         let mut r = inimage::light_at(m, l, n_models);
+        // a light of the add-on's light arrays (unit softspeed1): its name (+0x00) listed in soft-arrays.txt
+        r.array = crate::softarray::group(&(0..64).map(|i| m.u8(l + i)).take_while(|&c| c != 0).collect::<Vec<u8>>());
         l = m.u32(l + 0x140);
         r.next = (l != 0).then_some(p.st.lights.len() + 1);
         p.st.lights.push(r);

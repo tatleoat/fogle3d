@@ -262,6 +262,18 @@ class SI3DTextureNode(_SINode, bpy.types.Node):
                          description="First pixel row of the box")
     crop_y1: IntProperty(name="Top", default=0, min=-32768, max=32767, update=_changed,
                          description="Last pixel row of the box")
+    # a projection's frame (unit imp3): the projected methods take the model's points in its own space through this
+    # rotation, and scale the box of them about its centre; the cylinder and sphere move their centre by the
+    # translation times the box's half size
+    scaling: FloatVectorProperty(name="Projection scale", size=3, default=(1.0, 1.0, 1.0), update=_changed,
+                                 description="Projected methods: the box scaled about its centre (Softimage axes: "
+                                             "Y is Blender's Z)")
+    rotation: FloatVectorProperty(name="Projection rotation", size=3, subtype="EULER", default=(0.0, 0.0, 0.0),
+                                  update=_changed, description="Projected methods: the projection turned in the "
+                                                               "model's own space (Softimage axes: Y is Blender's Z)")
+    translation: FloatVectorProperty(name="Projection translation", size=3, default=(0.0, 0.0, 0.0), update=_changed,
+                                     description="Cylindrical and spherical: the centre moved, in half box sizes "
+                                                 "(Softimage axes: Y is Blender's Z)")
 
     def draw_buttons(self, context, layout):
         self.draw_faults(layout)
@@ -309,6 +321,9 @@ def draw_texture_details(node, layout):
         row = col.row(align=True)
         row.prop(node, "crop_y0")
         row.prop(node, "crop_y1")
+    if node.method in ("XY", "XZ", "YZ", "CYLINDER", "SPHERE"):
+        for p in ("scaling", "rotation", "translation"):
+            layout.prop(node, p)
 
 
 class SI3DTexture3DNode(_SINode, bpy.types.Node):
@@ -405,7 +420,9 @@ class SI3DWorldNode(_SINode, bpy.types.Node):
                                     "world colour)")
     fade: BoolProperty(name="Depth fade", default=False, update=_changed,
                        description="Surfaces fade to the fade colour with their distance from the camera")
-    fade_start: FloatProperty(name="Fade start", default=20.0, min=0.0, update=_changed, subtype="DISTANCE")
+    fade_start: FloatProperty(name="Fade start", default=20.0, soft_min=0.0, update=_changed, subtype="DISTANCE",
+                              description="Distance from the camera where the fade begins (may be below 0: the scene "
+                              "is already partly faded at the camera)")
     fade_end: FloatProperty(name="Fade end", default=100.0, min=0.0, update=_changed, subtype="DISTANCE")
     fade_colour: FloatVectorProperty(name="Fade colour", size=3, subtype="COLOR_GAMMA", min=0.0, max=1.0,
                                      default=(0.0, 0.0, 0.0), update=_changed)

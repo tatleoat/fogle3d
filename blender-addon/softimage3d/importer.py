@@ -256,10 +256,42 @@ def _texture_values(t, as_uv):
     crop = t.get("crop") or []
     if len(crop) == 5:      # the dump's [switch, x0, x1, y0, y1] (the record's +0x2e, +0x30 to +0x36)
         v["crop_flag"], v["crop"] = crop[0], list(crop[1:])
+    pr = t.get("projection") or {}
+    if not as_uv:           # a projection's frame (unit imp3): rotation +0x94, scaling +0xac, translation +0xa0
+        for k in ("rotation", "scaling", "translation"):
+            if pr.get(k) is not None:
+                v[k] = list(pr[k])
     return v
 
 
 PROJECTED = (1, 2, 3, 5, 6)
+
+
+def _xyz_rotation(rot):
+    """si-math's matrix_xyz_rotation (radians), the rows of the row-vector matrix (as blend2db's simat.rs has it)."""
+    sx, cx = math.sin(rot[0]), math.cos(rot[0])
+    sy, cy = math.sin(rot[1]), math.cos(rot[1])
+    sz, cz = math.sin(rot[2]), math.cos(rot[2])
+    return ((cy * cz, cy * sz, -sy),
+            (sx * sy * cz - cx * sz, sx * sy * sz + cx * cz, sx * cy),
+            (sx * sz + cx * sy * cz, sz * cx * sy - cz * sx, cx * cy))
+
+
+def _plane_in_object_space(g16, rot):
+    """Whether a plane projection (XY, XZ, YZ) with the rotation `rot` of a model with the global matrix `g16`
+    (Softimage, row vectors) has an exact form for blend2db, which writes the vertices in world space: the columns of
+    G3^-1 r orthogonal (blend2db simat::texture2d_object_space; a mirror is taken by the axis the plane does not read)."""
+    g = Matrix((g16[0:3], g16[4:7], g16[8:11]))
+    try:
+        gi = g.inverted()
+    except ValueError:
+        return False
+    k = gi @ Matrix(_xyz_rotation(rot))
+    cols = [Vector((k[0][j], k[1][j], k[2][j])) for j in range(3)]
+    if any(c.length == 0.0 for c in cols):
+        return False
+    cols = [c.normalized() for c in cols]
+    return all(abs(cols[i].dot(cols[j])) <= 1e-6 for i, j in ((0, 1), (0, 2), (1, 2)))
 
 
 # ------------------------------------------------------------------ lights: the Softimage values kept for the engine
@@ -527,6 +559,11 @@ class Builder:
         uvs = {int(k): v for k, v in (g.get("uv") or {}).items()}
         faces, normals, fmat, per_tex, render_uv = [], [], [], {t: [] for t in uvs}, []
         dropped = 0
+        # a faceted mesh (mesh flag 0x2) renders every polygon with its own normal, whatever normals its corners
+        # store (the renderer marks every edge and gives each corner the polygon's normal): its faces are made flat
+        # (unit imp3; PICTURE-SKELETON's head, cube105, stores smooth ones). That normal follows the polygon's
+        # winding, which is kept, as for a faceted mesh whose stored normals are zero.
+        faceted = bool(g.get("faceted"))
         for pi, poly in enumerate(g["polygons"]):
             if pi in hidden:
                 dropped += 1
@@ -566,11 +603,11 @@ class Builder:
                     if nm3 is not None:
                         n = nm3 @ n
                     pn.append(n)
-                if self._orient([verts[poly[ci]] for ci in piece], pn):
+                if not faceted and self._orient([verts[poly[ci]] for ci in piece], pn):
                     piece = piece[::-1]
                     pn = pn[::-1]
                 faces.append([poly[ci] for ci in piece])
-                normals.append(pn)
+                normals.append([Vector((0.0, 0.0, 0.0))] * len(pn) if faceted else pn)
                 fmat.append(local)
                 for t, lay in uvs.items():
                     row = lay[pi]
@@ -624,6 +661,34 @@ class Builder:
                     same = False
                     break
             self._uv_same[key] = seen and same
+        return self._uv_same[key]
+
+    def _keeps_projection(self, t):
+        """Whether a projected texture stays a projection instead of UV (unit imp3): it bumps (the record's bump flag
+        +0x120, or a bump factor beyond 0.0001), its method is a plane (XY, XZ, YZ: the renderer bumps those along the
+        plane's axes, the others along the coordinates as for UV), and on every model that carries it the projection
+        has an exact form in the object's space with vertices written in world space (_plane_in_object_space); a model
+        whose vertices come from another's frame (lattice) keeps UV."""
+        if t["method"] not in (1, 2, 3):
+            return False
+        f = t.get("factors") or []
+        if not (t.get("roughness") or (len(f) > 6 and abs(f[6]) > 1e-4)):
+            return False
+        key = ("projection", t["id"])
+        if key not in self._uv_same:
+            rot = ((t.get("projection") or {}).get("rotation")) or [0.0, 0.0, 0.0]
+            seen, ok = False, True
+            for m in self.models:
+                g = m.get("geometry") or {}
+                ids = [x for mid in (m.get("materials") or []) for x in (self.materials.get(mid) or {}).get("textures", [])]
+                ids += list(g.get("own_textures") or [])
+                if t["id"] not in ids:
+                    continue
+                seen = True
+                if m.get("latdep") is not None or not _plane_in_object_space(m["global_matrix"], rot):
+                    ok = False
+                    break
+            self._uv_same[key] = seen and ok
         return self._uv_same[key]
 
     def _first_uv_texture(self, mid, uvs, own):
@@ -750,8 +815,11 @@ class Builder:
                 # the first texture is the render UV layer's; a later projected one joins it when the renderer gives it
                 # the same coordinates on every model (unit extra2: Torch_Fire's flame grid, flamme and fire_shade2,
                 # both YZ; the second, the flame's textured shadow, was left a projection the engine does not carry)
+                # a bump-mapped plane projection keeps its projection when blend2db can carry it exactly: made UV it
+                # bumps along the UV frame, not the plane's axes (unit imp3: MATTER-displacement, Missile, Sand_Gust)
                 as_uv = bool(self.o.get("projected_as_uv", True) and t["method"] in PROJECTED
-                             and (first is None or self._same_uv(first, t["id"])))
+                             and (first is None or self._same_uv(first, t["id"]))
+                             and not self._keeps_projection(t))
                 tn = self.mn.new_texture_node(node, img, _texture_values(t, as_uv), scope=scope)
                 tn["si3d_texture_id"] = t["id"]
                 tn["si3d_method"] = t["method"]

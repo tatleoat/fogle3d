@@ -3,7 +3,8 @@
 Status: the combination checked 2026-10-30 (final1). The full sweep is extra2's of 2026-10-29 over all 334 corpus
 scenes, reconverted with every fix below but sky2's (re/out/extra2/sweep-all); sky2's and extra1/extra2's fixes
 together were re-measured on 28 scenes, those either of them touches and five controls (re/out/final1/sweep).
-fidelity2's final sweep of 2026-10-29 is the earlier column.
+fidelity2's final sweep of 2026-10-29 is the earlier column. imp3 (2026-10-30, causes 18 to 21) re-measured only
+the 67 scenes it touches and controls (re/out/imp3/imp3-all.tsv; not merged into the band counts below).
 
 ## What is measured
 
@@ -139,18 +140,63 @@ colours: overlap ≥ 0.9; partial: the rest). The final run is given under both 
    model now becomes UV too, and blend2db writes it (Torch_Fire's flame grid: flamme and fire_shade2). With 16,
    the flame's shadow is there: Torch_Fire wrong colours (rmse 0.04) to match (0.0042), OBJECT-FLAMBEAU_MR wrong
    colours (0.0401) to match (0.0068).
+18. **Bump-mapped projections carried as projections (imp3).** The renderer bumps a UV texture along (n × t, t), t
+   the direction in which v grows on the triangle, and a planar projection along fixed axes (XY: x and y; XZ: x and
+   z; YZ: y and z), so a projected bump map made UV could bump the other way. A planar texture that bumps (roughness
+   on, or a bump factor) now stays a projection: the SI Texture node keeps the method and the dump's projection
+   scaling, rotation and translation (properties "Projection scale/rotation/translation"), export.py hands them
+   over, blend2db writes them. blend2db writes vertices in world space (cause 10), so it folds the object's matrix
+   into the projection's rotation (`simat::texture2d_object_space`): exact when that matrix, seen through the
+   projection's rotation, is a scaling along the projection's axes, which the renderer's fit to the bounding box
+   drops. The importer keeps the projection only where that holds for every model carrying the texture and none
+   has a lattice or deformation; elsewhere the texture becomes UV as before. blend2db
+   also writes a later global texture carried this way (cause 17's rule). Twelve corpus scenes have such textures;
+   on the scenes re-measured (re/out/imp3/sweep, against the combined table): MATTER-displacement rmse 0.0256 to 0
+   (pixel-identical), obstacle-cascade wrong colours to match (rmse 0.0435 to 0.0059, `bad` 0.119 to 0.0003: the
+   "faceted water" and "rocks elsewhere" of the former open cause 4 were the bumps lit from the other side), Missile
+   0.0136 to 0.0009 (`bad` 0.0001 to 0), Hawaiian_Fog 0.0143 to 0.0080, Leaves 0.0021 to 0.0015, Warrior 0.0029 to
+   0.0028, Fly_Thru 0.0017 to 0.0016, OBJECT-FLAMBEAU_MR 0.0068 to 0.0067. Sand_Gust: open cause 2.
+19. **Camera roll animation (imp3).** blend2db wrote the roll of a still camera only; an animated camera's roll was
+   lost when the database carries a range (frames "Scene range", or motion blur), so the program rolled it with the
+   first frame's value. It now writes a roll curve (the CamRoll relation, degrees, unwrapped) when the roll
+   changes. CONSTRAINT-CameraOnCircleRolling (roll 0.30 rad at frame 1, changing over 1 to 100), a database of
+   frames 50 to 100 rendered at frame 75 against the reference at 75: rmse 0.1097 (41 % of the pixels off by more
+   than 0.1) without the curve, 0.0013 (none) with it. A still frame was right before and is unchanged (frame 50:
+   rmse 0.0002 either way).
+20. **Negative fade start (imp3).** The SI World node clamped the depth fade's start to 0; IK-PageTurn's set-up
+   has −2. The start now has a soft minimum only: IK-PageTurn rmse 0.0227 to 0.0213, `bad` 0.0127 to 0.0084
+   (match before and after; part of open cause 4).
+21. **Faceted meshes with stored normals (imp3).** A faceted mesh (flag 0x2) is drawn with each polygon's own normal
+   whatever its corners store: the renderer marks every edge hard and gives every corner the polygon's normal. Cause 4
+   made a face flat only when its corners have no normal; 47 corpus scenes have faceted meshes whose corners store
+   smooth normals (the motion-capture skeletons of the EXO_/PUP_/RAW_ scenes, whose head is cube105, INVKIN-Walker's
+   seven meshes, Man_V3_0). The importer now makes every polygon of a faceted mesh flat and keeps the scene's winding
+   (which gives that normal) instead of turning it to agree with the stored normals. All 47 re-measured
+   (re/out/imp3/sweep-facall.tsv, against the combined table): 37 better, 10 the same or nearly, none worse;
+   INVKIN-Walker wrong colours to match (rmse 0.0128 to 0, `bad` 0.1192 to 0: the former open cause "INVKIN-Walker's
+   legs"), PICTURE-SKELETON 0.0162 to 0.0001 (`bad` 0.0195 to 0), EXO_MAG_SOLO-MORPH_STRUCTURE 0.0154 to 0.0002,
+   EXO_OPT_DUO-AIKIDO_COSI_placing 0.0156 to 0.0003, EXO_MAG_DUO-AIKIDO_COSI 0.0104 to 0, RAW_MAG_DUO-AIKIDO_COSI
+   0.0080 to 0.0001 (`bad` 0.0243 to 0), the four EXO_MAG_SOLO-*_CALIB to 0 or 0.0001, 26 of the other 27 skeleton
+   scenes from 0.003 to 0.010 to at most 0.0008, Man_V3_0 0.0030 to 0.0002. The same: EXO_MAG_SOLO-SKIP_WALK (0.0001),
+   Beauty_shot, CubicMap-House, Shock3D-Bullet, Sunbeams, INVKIN-SideWalk, actor-sidewalk_joe (their faceted meshes do
+   not decide the picture); Sand_Gust, Env_Moonscape and Env_Sunset barely move and keep their band.
 
 ## Open, by cause
 
-1. **Thin or tiny pictures.** Skeleton and calibration scenes (EXO_MAG_SOLO-*_CALIB, MC-*, PICTURE-SKELETON) cover
-   2 to 7 % of the frame; one-pixel differences of thin limbs dominate `bad`. MC-5_mains' reference is 32 × 27 pixels.
-   Look at the pictures rather than trust the band.
+1. **Thin or tiny pictures.** The MC-* tutorial scenes cover a few per cent of the frame; one-pixel differences of
+   thin limbs dominate `bad`. MC-5_mains' reference is 32 × 27 pixels. Look at the pictures rather than trust the
+   band. (The skeleton and calibration scenes once listed here were cause 21; PICTURE-SKELETON's K, a missing wedge,
+   was the sliver polygons the importer now drops, so its converted .blend only had to be made again.)
 2. **Sand_Gust terrain.** The sky is fixed (cause 10: clouds, as in the reference, instead of stars). The terrain
    (grid7) still differs: the reference is dark with a coarse grain at the front right, the conversion has a fine,
    lighter grain all over ("wrong colours"; `bad` 0.234, rmse 0.078 with all fixes combined, `bad` 0.256 with sky2's
-   alone). Its 3D texture is now in the object's space; the rest of its material is three 2D textures (TILES.1, UV,
-   15 × 15 repeats, roughness 14.35; marbre4 twice, XZ, cropped).
-   Not found; the 2D textures' roughness (bump) under the model's scaling of 110 × 133 × 86 is the next suspect.
+   alone). Its 3D texture is now in the object's space; the rest of its material is three bumped 2D textures, all
+   XZ projections (TILES.1, 15 × 15 repeats, bump 14.35; marbre4 twice, cropped, the second rotated 180° about y).
+   With cause 18 they are projections again, folded exactly (grid7 is only scaled, 110 × 86 × 133): rmse 0.0783 to
+   0.0779 but `bad` 0.2345 to 0.2516, the far mountains on the right now lighter than the reference (a sheet:
+   re/out/imp3/sand_cmp.png, reference | final1 | imp3 | newly bad red, newly good green). So the bump's direction
+   is not the cause. The lane carries no particles (the scene is a particle gust); the overall lighter terrain is
+   not found.
 3. **mental ray environment shaders: Env_Sunrise, Env_Sunset, Env_Moonscape (unit sky1, sky2).** The Softimage
    renderer does not run mental ray shaders (the original's are irix/nt binaries); its picture shows an empty sky and
    dark water. The add-on now draws an approximation of the shaders' intent over the engine's picture when the
@@ -160,23 +206,28 @@ colours: overlap ≥ 0.9; partial: the rest). The final run is given under both 
    0.050 to 0.563, Env_Moonscape 0.039 to 0.637). With the sky switched off (`mrfx.switch_sky`) they are the
    engine's picture as before; the import test compares them that way. The volume shaders (March_Fractal, March_Smoke,
    lightning) and the fur pass of the other 11 shader scenes are not approximated.
-4. **obstacle-cascade.** The rocks sit elsewhere and the water surface is faceted.
-5. **A bump-mapped projected texture carried as UV.** The renderer bumps a UV texture along (n × t, t), t the
-   direction in which v grows on the triangle, and a planar projection along fixed axes (XY: x and y; XZ: x and z;
-   YZ: y and z). Made UV, a projected bump map can bump the other way: MATTER-displacement's bumps are lit from the
-   other side (rmse 0.0126 to 0.0256 with the UV fix, still match; the u mirror had cancelled half of it); Missile's
-   projected bump maps likewise (0.0335 to 0.0344). With sky2's fixes as well: MATTER-displacement 0.0256 (`bad`
-   0.049), Missile 0.0136 (`bad` 0.0001), where sky2's alone gave 0.0126 and 0.0112.
-   Carrying the projection itself instead of UV coordinates would fix it: the kept lane database with the texture
-   written back as XZ (method 2) renders at rmse 0.0119, bad 0.0044 (UV: 0.0282, 0.0222, same render). Not done:
-   blend2db does not write a texture's projection rotation, scaling and translation (the dump's `projection`; the
-   identity here) and projects the vertices it writes, so the rule would hold only for an identity projection on a
-   model whose written space is the original's.
-6. **IK-PageTurn's far floor.** The floor is noIcon.pic tiled 22 × 22; seen at a grazing angle it shows vertical
+4. **IK-PageTurn's far floor.** The floor is noIcon.pic tiled 22 × 22; seen at a grazing angle it shows vertical
    streaks in the lane that the reference does not have (top 40 rows: mean level 4.4 against 2.3 of 255). The
    picture is the same pixel for pixel, the texture coordinates are (54 of 54 corners), and the set-up's fade is
-   carried except that the SI World node clamps the fade start to 0 (the scene has −2; measured: 0.13 levels
-   there). Not found.
+   carried, its start of −2 too since cause 20. Not found.
+5. **Roll-Carpet (frame 65): the triangles of concave polygons.** The stairs' two sides are concave 12-gons with one
+   normal; the renderer cuts them into triangles its own way (`triangulate_contour`: one side a fan from its first
+   corner, the other ears at every second corner), Blender (whose triangles export.py hands blend2db) another, and the
+   shading follows the triangles' diagonals. Re-triangulating the two sides in the converted .blend changes the lane
+   (`re/tools/imp3/retri.py`; Blender's ear clipping, its default: rmse 0.0448, `bad` 0.0596; its "beauty" triangles:
+   0.0459, 0.0769), and the renderer's own triangles of the scene's polygons (`re/tools/imp3/tri_probe`) differ from
+   the lane's on both sides. Not fixed: the importer would have to make the polygons the renderer's triangles
+   (si-import-dump has them, `poly_tris`), or blend2db write polygons and let the renderer cut them; either changes
+   every scene with n-gons, so it needs a full sweep.
+6. **What is not carried: IK, constraints, expressions, particles, dynamics.** Animation is baked per frame, so a
+   first frame loses only what the program evaluates differently or the import drops (particles).
+   `re/tools/imp3/rank_losses.py` ranks the scenes that still differ and hold one of those causes
+   (re/out/imp3/losses.txt, on the combined table with imp3's rows): 32 scenes, 67 before cause 21. By rmse: Sand_Gust
+   (particles; open cause 2), IK-PageTurn (46 joints; open cause 4), TMP-AIKIDO_C (24 joints, 0.0162),
+   Ambulate-the_walk (0.0150), keyboard-MotionCap (0.0149), INVKIN-SideWalk (0.0145), actor-sidewalk_joe (joints and
+   particles, 0.0134), Cow (0.0125), Weather (particles, 0.0121), Duplicator-Brush (particles, 0.0109); the rest are
+   below 0.007. That a scene holds such a cause does not prove it is why the scene differs (IK-PageTurn's floor is
+   not).
 
 ## Tools (re/tools/fidelity1)
 
@@ -194,6 +245,11 @@ colours: overlap ≥ 0.9; partial: the rest). The final run is given under both 
   database and the picture), `diffpics.py` (reference | lane | difference sheets); `re/tools/extra2/uvcmp.py` (texture
   coordinates of two dumps compared corner by corner), `bandcmp.py` (two sweep tables: band changes and counts),
   `suites.sh` (blender3's 12 modes and nodes1's four with its own output folder).
+- Unit imp3: `re/tools/imp3/at_frame.py` (a copy of a .blend whose start frame, and so the frame sweep.py compares,
+  is another; `--range LAST` makes a still render's database carry the animation), `rank_losses.py` (the scenes a
+  table shows different, ranked by kinematics, joints, particles and dynamics their dumps hold), `retri.py` (a .blend
+  with one object's n-gons re-triangulated by another of Blender's methods), `tri_probe` (the renderer's triangles of
+  polygons read from stdin, through the ported `triangulate_contour`).
 - Unit final1: `re/tools/final1/same_ref.py` (two reference folders compared picture by picture, run with Blender's
   Python), `suites.sh` (blender3, nodes, framemap, install, viewport logic, legacy engine, blend2db tests and the
   bundle check, with its own output folder).

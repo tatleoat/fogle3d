@@ -21,9 +21,9 @@ on its own from the command line.
 
 Both pictures were rendered by Fogle3D from Blender scenes built from scratch for this page (our own geometry and
 generated textures; nothing from Softimage 3D's sample content; the script is `re/tools/pics/make_scenes.py`). They
-are 1920x1280 renders with the add-on's default settings, shown here at 1600 px. The times were measured on a
-22-core Linux machine that was busy with other jobs at the same time (load average 50 to 80), so the wall-clock
-times are longer than on an idle machine; the CPU times (all threads added up) compare the two renderers more fairly.
+are 1920x1280 renders with the add-on's default settings, shown here at 1600 px. The times were measured on an
+otherwise idle 22-core Linux machine, from Blender's start to the finished picture (headless, scene export included);
+the CPU times are all threads added up.
 
 ![Glass and metal still life](docs/images/still-life-glass-metal.jpg)
 
@@ -31,14 +31,14 @@ times are longer than on an idle machine; the CPU times (all threads added up) c
 generated checker floor in a room, lit by an area light and a point light. Ray traced reflection and refraction (ray
 depth 4, chosen automatically for a scene with glass), soft shadows from the area light (drawn as 24 lights with
 ray traced shadows spread over its square: the setting Soft shadow lights, default 24), highlights sized from each
-material's roughness, the program's adaptive anti-aliasing. Fogle3D: 98 s wall clock, 405 s CPU. The same scene in
-Blender Cycles (CPU, 128 samples, no denoising, 8 bounces): 309 s wall clock, 1,763 s CPU.*
+material's roughness, the program's adaptive anti-aliasing. Fogle3D: 16 s wall clock, 259 s CPU. The same scene in
+Blender Cycles (CPU, 128 samples, no denoising, 8 bounces): 88 s wall clock, 1,660 s CPU.*
 
 ![NURBS vase and wine glass](docs/images/nurbs-vase-glass.jpg)
 
 *NURBS surfaces: a vase and a wine glass (surfaces of revolution, cubic NURBS), a torus and a sphere patch, glossy
-painted materials, soft shadows from the area light (24 lights). Fogle3D: 55 s wall clock, 208 s CPU. Blender
-Cycles (CPU, 128 samples, no denoising): 68 s wall clock, 387 s CPU.*
+painted materials, soft shadows from the area light (24 lights). Fogle3D: 8 s wall clock, 80 s CPU. Blender
+Cycles (CPU, 128 samples, no denoising): 20 s wall clock, 369 s CPU.*
 
 What is still approximate, next to Cycles:
 

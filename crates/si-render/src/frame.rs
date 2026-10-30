@@ -58,25 +58,34 @@ impl ShadeEnv for Tracer {
         s_trace_marked(&mut self.bsp, &mut self.mailbox, &mut self.met, st, ray, tn, distance, light, &mut |st, ray, mat, p| shadow_map(st, &mut TexturesOnly, ray, mat, p))
     }
     fn s_array(&mut self, st: &mut ShadeState, ray: &mut Ray, tn: usize, distance: f32, light: usize) -> [f32; 4] {
+        use crate::softarray::{Passes, Seen};
         // a selective light's walk skips the models it does not light: traced as the original traces it
         if let (0, Some(b)) = (st.lights[light].selective, &self.arrays) {
+            let mut pass = Passes::default();
+            let answer = |seen: Seen, st: &ShadeState, pass: &Passes| -> Option<[f32; 4]> {
+                match seen {
+                    Seen::Clear => Some([1.0, 1.0, 1.0, st.glb.unset]),
+                    Seen::Opaque => {
+                        let u = si_x87::fmov(st.lights[light].umbra);
+                        Some([u, u, u, st.glb.unset])
+                    }
+                    Seen::Through => Some(crate::softarray::through(st, light, pass)),
+                    Seen::Unsure => None,
+                }
+            };
             if crate::softarray::checking() {
                 let t0 = std::time::Instant::now();
-                let seen = b.shaft_hit(&mut self.shaft, st, light, ray.origin, ray.dir, tn, crate::softarray::SHADOW_TMIN, distance);
+                let seen = b.shaft_hit(&mut self.shaft, st, light, ray.origin, ray.dir, tn, crate::softarray::SHADOW_TMIN, distance, &mut pass);
+                let mine = answer(seen, st, &pass);
                 let t1 = std::time::Instant::now();
                 let walk = self.s_trace(st, ray, tn, distance, light);
                 let ns = ((t1 - t0).as_nanos() as u64, t1.elapsed().as_nanos() as u64);
-                crate::softarray::record(seen, walk, si_x87::fmov(st.lights[light].umbra), ns);
+                crate::softarray::record(seen, mine, walk, pass.n, ns);
                 return walk;
             }
-            let seen = b.shaft_hit(&mut self.shaft, st, light, ray.origin, ray.dir, tn, crate::softarray::SHADOW_TMIN, distance);
-            match seen {
-                crate::softarray::Seen::Clear => return [1.0, 1.0, 1.0, st.glb.unset],
-                crate::softarray::Seen::Opaque => {
-                    let u = si_x87::fmov(st.lights[light].umbra);
-                    return [u, u, u, st.glb.unset];
-                }
-                crate::softarray::Seen::Unsure => {}
+            let seen = b.shaft_hit(&mut self.shaft, st, light, ray.origin, ray.dir, tn, crate::softarray::SHADOW_TMIN, distance, &mut pass);
+            if let Some(f) = answer(seen, st, &pass) {
+                return f;
             }
         }
         self.s_trace(st, ray, tn, distance, light)

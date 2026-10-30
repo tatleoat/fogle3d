@@ -277,8 +277,8 @@ def check_memory(log_path, mem_kb, size=None):
 
 def counts(n_frames, animation):
     """(processes, band threads) for a render. Preference value, else env (SI3D_PROCESSES, SI3D_BAND_THREADS),
-    else the default: cores - 1 capped at 16. Animations spread over processes (one band thread each); a
-    still is one process with band threads."""
+    else the default: cores - 1, at most 16 processes for an animation (one band thread each) and at most
+    MAX_BAND_THREADS band threads for a still (one process)."""
     pr = prefs()
     procs = (pr.processes if pr is not None else 0) or _env_int("SI3D_PROCESSES")
     thr = (pr.band_threads if pr is not None else 0) or _env_int("SI3D_BAND_THREADS")
@@ -287,7 +287,7 @@ def counts(n_frames, animation):
     if animation:
         k = max(1, min(procs or auto, cap, max(1, n_frames)))
         return k, max(1, min(thr or 1, cap))
-    return 1, max(1, min(thr or auto, cap))
+    return 1, max(1, min(thr or parallel.auto_count(cap=parallel.MAX_BAND_THREADS), parallel.MAX_BAND_THREADS))
 
 
 # ----------------------------------------------------------------------------- tool-only scene source

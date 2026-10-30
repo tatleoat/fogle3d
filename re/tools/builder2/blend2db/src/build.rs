@@ -310,7 +310,7 @@ fn light_file(kind: i32, name: &str, colour: [f32; 3], pos: [f64; 3], interest: 
 /// `half * o / oof` samples (cone filter, whole numbers), o being (near - d) * half in front of the sharp zone, 0 inside it and
 /// oof * (d - far) / (oof - far) behind it, held to `half`; `half` = (lines - 1) / 2 and lines = level * circle (odd, at least 5).
 /// Blender's circle of confusion (diameter in pixels) is aperture * f / (focus - f) * |d - focus| / d / pixel size; the fit
-/// picks `half` from the circle at a quarter of the focus distance (at most DOF_HALF_MAX) and then near, far and oof by least
+/// picks `half` from the circle at a quarter of the focus distance (at most `half_max`, see DOF_HALF_MAX) and then near, far and oof by least
 /// squares of the radius over distances from focus / 6 (not nearer than the clip) to 8 * focus. Linear ramps cannot follow the hyperbola
 /// of the near side exactly: an approximation. None when the blur would stay under half a sample.
 struct DofFit {
@@ -321,7 +321,11 @@ struct DofFit {
     half: i32,
 }
 
+/// The cap on `half`: DOF_HALF_MAX samples per 960 pixels of the picture's sensor side (times the sampling level), from
+/// DOF_HALF_MAX to DOF_HALF_TOP. The blur costs lines squared per pixel; a fixed cap of 16 gave a 1920 picture half the blur
+/// of a 960 one (unit dof2: the near red sphere's edge 5.3 px wide against Cycles' 9.3, 9.7 with 32; 8.5 s -> 10.1 s).
 const DOF_HALF_MAX: i32 = 16;
+const DOF_HALF_TOP: i32 = 32;
 /// The cone filter spreads less than a lens disc of the same radius: the target radius is this times the disc's (measured, see the finding).
 const DOF_CONE: f64 = 1.0;
 
@@ -335,6 +339,7 @@ fn dof_fit(lens_mm: f64, sensor_mm: f64, sensor_px: f64, focus: f64, fstop: f64,
     }
     let px_m = sensor_mm / 1000.0 / sensor_px;
     let c_inf = f / fstop * f / (focus - f) / px_m;
+    let half_max = ((DOF_HALF_MAX as f64 * level * sensor_px / 960.0).round() as i32).clamp(DOF_HALF_MAX, DOF_HALF_TOP);
     let rho = |d: f64| DOF_CONE * level * 0.5 * c_inf * (d - focus).abs() / d;
     let d_lo = (focus / 6.0).max(clip0 * 1.5);
     let d_hi = 8.0 * focus;
@@ -351,11 +356,11 @@ fn dof_fit(lens_mm: f64, sensor_mm: f64, sensor_px: f64, focus: f64, fstop: f64,
     // (error, half, near, far, oof): `half` too is searched, from a third of the reference radius to the cap, the error carrying a
     // small cost per sample of half (the blur costs lines squared per pixel)
     let mut best = (f64::MAX, 1, focus, focus, 4.0 * focus);
-    let lo_half = ((ref_rho / 3.0).ceil() as i32).clamp(1, DOF_HALF_MAX);
-    let hi_half = (ref_rho.ceil() as i32).clamp(lo_half, DOF_HALF_MAX);
+    let lo_half = ((ref_rho / 3.0).ceil() as i32).clamp(1, half_max);
+    let hi_half = (ref_rho.ceil() as i32).clamp(lo_half, half_max);
     for half in lo_half..=hi_half {
         let hf = half as f64;
-        let target: Vec<f64> = ds.iter().map(|&d| rho(d).min(DOF_HALF_MAX as f64)).collect();
+        let target: Vec<f64> = ds.iter().map(|&d| rho(d).min(half_max as f64)).collect();
         let radius = |d: f64, zn: f64, zf: f64, oof: f64| -> f64 {
             let o = if d < zn { ((zn - d) * hf).min(oof) } else if d <= zf { 0.0 } else if d < oof { oof * (d - zf) / (oof - zf) } else { oof };
             (hf * o / oof).floor()
@@ -380,6 +385,64 @@ fn dof_fit(lens_mm: f64, sensor_mm: f64, sensor_px: f64, focus: f64, fstop: f64,
     Some(DofFit { near, far, oof, circle, half })
 }
 
+/// The camera as the depth of field's frame marker needs it (Softimage space; `still` is Blender's matrix of the still frame).
+struct FrameCam {
+    pos: [f64; 3],
+    fwd: [f64; 3],
+    up: [f64; 3],
+    right: [f64; 3],
+    tan_v: f64,
+    aspect: f64,
+    h: f64,
+    near: f64,
+    far: f64,
+    still: M4,
+}
+
+/// The depth of field's frame marker (unit dof2): the renderer draws and blurs only the box of the filed geometry on the picture
+/// plane (si_setBounds, 0x0826f318; crates/si-render update.rs `set_bounds`); the lines outside it are the plain background,
+/// unblurred. Cycles blurs the whole picture, so an object that reaches the box's edge (a sphere's top against the sky) was cut
+/// off there in a straight line. Two small triangles, one in each of two opposite corner pixels, facing the camera, make the box
+/// the whole picture. Each lies on its pixel's ray beyond where that ray leaves the box of the scene's vertices (so it is in front
+/// of nothing), within the clip. Answers the vertices and the triangles (corners, normal towards the camera) and the two depths.
+fn frame_marker(fc: &FrameCam, geo: ([f64; 3], [f64; 3])) -> (Vec<[f32; 3]>, Vec<Vec<Corner>>, [f64; 2]) {
+    let (lo, hi) = geo;
+    let size = (0..3).map(|k| hi[k] - lo[k]).fold(0.0f64, f64::max).max(1e-3);
+    let hh = fc.tan_v; // half the picture's height at depth 1
+    let hw = hh * fc.aspect;
+    let p = 2.0 * hh / fc.h; // a pixel at depth 1
+    let normal = f32x3([-fc.fwd[0], -fc.fwd[1], -fc.fwd[2]]);
+    let (mut verts, mut tris, mut depths) = (Vec::new(), Vec::new(), [0.0; 2]);
+    // pixel centres (at depth 1) of the top-left and bottom-right corner pixels
+    for (i, (a, b)) in [(-hw + 0.5 * p, hh - 0.5 * p), (hw - 0.5 * p, -hh + 0.5 * p)].into_iter().enumerate() {
+        let dir = add(add(fc.fwd, fc.right, a), fc.up, b);
+        // the ray pos + t dir (t: depth along the view) against the vertices' box
+        let (mut t0, mut t1) = (f64::NEG_INFINITY, f64::INFINITY);
+        for k in 0..3 {
+            if dir[k].abs() < 1e-12 {
+                if fc.pos[k] < lo[k] || fc.pos[k] > hi[k] {
+                    (t0, t1) = (1.0, 0.0);
+                }
+            } else {
+                let (u, v) = ((lo[k] - fc.pos[k]) / dir[k], (hi[k] - fc.pos[k]) / dir[k]);
+                t0 = t0.max(u.min(v));
+                t1 = t1.min(u.max(v));
+            }
+        }
+        let centre = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, (lo[2] + hi[2]) / 2.0];
+        let d = if t0 <= t1 && t1 > 0.0 { t1 + 0.01 * size } else { dot(add(centre, fc.pos, -1.0), fc.fwd) };
+        let d = d.clamp(2.0 * fc.near, 0.95 * fc.far);
+        depths[i] = d;
+        // a right triangle with legs of 0.6 pixel over the pixel's centre, counter-clockwise seen from the camera
+        let o = add(add(add(fc.pos, fc.fwd, d), fc.right, (a - 0.2 * p) * d), fc.up, (b - 0.2 * p) * d);
+        let base = verts.len();
+        for q in [o, add(o, fc.right, 0.6 * p * d), add(o, fc.up, 0.6 * p * d)] {
+            verts.push(f32x3(q));
+        }
+        tris.push((0..3).map(|k| Corner { vertex: base + k, normal, uv: [0.0; 2] }).collect());
+    }
+    (verts, tris, depths)
+}
 
 fn patch_setup(template: &str, first: i32, last: i32, w: i64, h: i64, ambience: [f32; 3], out_name: &str, ray_depth: i32, back_culling: bool, extra: &[(String, String)]) -> String {
     let mut o = String::new();
@@ -486,6 +549,7 @@ fn build(json: &str, out: &str, tdb: &str, tscene: &str, rsrc: &str) -> Result<S
     let mut skipped_notes: Vec<String> = sc["skipped"].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(String::from)).collect();
     let mut model_src: Vec<String> = Vec::new(); // the Blender object each model comes from (light linking)
     let tune = crate::gloss::tune();
+    let mut geo_box: Option<([f64; 3], [f64; 3])> = None; // the vertices' box (Softimage space), for the depth of field's frame marker
     for ob in sc["objects"].as_array().into_iter().flatten() {
         let oname = clean(ob["name"].as_str().unwrap_or("obj"), &mut names);
         let m = mat(&ob["matrix_world"]);
@@ -517,6 +581,14 @@ fn build(json: &str, out: &str, tdb: &str, tscene: &str, rsrc: &str) -> Result<S
         if verts.is_empty() || tris.is_empty() {
             skipped_notes.push(format!("{oname} (no triangles)"));
             continue;
+        }
+        for v in &verts {
+            let v = [v[0] as f64, v[1] as f64, v[2] as f64];
+            let (lo, hi) = geo_box.get_or_insert((v, v));
+            for k in 0..3 {
+                lo[k] = lo[k].min(v[k]);
+                hi[k] = hi[k].max(v[k]);
+            }
         }
         // face normals for corners without a given normal
         let mut corners: Vec<Vec<Corner>> = Vec::new();
@@ -811,6 +883,7 @@ fn build(json: &str, out: &str, tdb: &str, tscene: &str, rsrc: &str) -> Result<S
     // ---- camera
     let mut cam = camera::Camera::perspective_default();
     let (cam_pos, cam_int);
+    let mut frame_cam: Option<FrameCam> = None; // set when the depth of field is on (fn frame_marker)
     {
         let c = &sc["camera"];
         if c.is_null() {
@@ -862,6 +935,18 @@ fn build(json: &str, out: &str, tdb: &str, tscene: &str, rsrc: &str) -> Result<S
                     cam.out_of_focus = d.oof as f32;
                     cam.maximum_coc = d.circle as f32;
                     cam.focal_distance = focus as f32;
+                    frame_cam = Some(FrameCam {
+                        pos: pos_s,
+                        fwd: fwd_s,
+                        up: up_s,
+                        right: conv(norm([m[0][0], m[1][0], m[2][0]])),
+                        tan_v: (fov_v / 2.0).tan(),
+                        aspect,
+                        h: h as f64,
+                        near: cam.near as f64,
+                        far: cam.far as f64,
+                        still: m,
+                    });
                     skipped_notes.push(format!("depth of field: approximated, sharp zone {:.2} to {:.2}, blur up to {} samples (level {}), linear ramps to {:.1} (the program's blur has no true lens)", d.near, d.far, d.half, level, d.oof));
                 }
             }
@@ -1078,7 +1163,9 @@ fn build(json: &str, out: &str, tdb: &str, tscene: &str, rsrc: &str) -> Result<S
         for (j, &q) in pts.iter().enumerate() {
             let (pos, fwd) = place(&m, q);
             let tag = if n == 1 { String::new() } else { format!("x{}", j + 1) };
-            if n > 1 {
+            // listed: an array's lights, and a single light with ray-traced shadows as an array of one (unit soft4: its
+            // shadow rays are answered the same way, without the shafts; the name has no x, so it is its own array)
+            if n > 1 || shadow {
                 let base = match kind_s {
                     "SUN" => "inf",
                     "SPOT" | "AREA" => "spot",
@@ -1199,6 +1286,52 @@ fn build(json: &str, out: &str, tdb: &str, tscene: &str, rsrc: &str) -> Result<S
         skipped_notes.push("no light in the scene: a black light stands in for the program's default light".into());
     }
     report += &format!("lights {}\n", light_roots.len());
+    // ---- depth of field: the frame marker (fn frame_marker), after the lights so that their fit does not see it; a
+    // transparent constant material (shadow rays pass it, its pixel shows what is behind), no light lists it
+    if let (Some(fc), Some(gb)) = (&frame_cam, geo_box) {
+        let (verts, polys, depths) = frame_marker(fc, gb);
+        let mname = format!("mat{}", mat_elems.len() + 1);
+        let mut mt = flat_material(&mname, [0.0; 3], [0.0; 3], [0.0; 3], 1.0, 1.0, 0.0);
+        mt.shading = 1;
+        std::fs::write(dir("MATERIALS")?.join(format!("{prefix}-{mname}.1-0.mtr")), si_hrc::write_material(&mt, si_file::VERSION_OUTPUT)).map_err(|e| e.to_string())?;
+        model_mats.push((models.len(), mat_elems.len()));
+        mat_elems.push(format!("{prefix}-{mname}.1-0"));
+        mat_src.push(None);
+        let oname = clean("dof_frame", &mut names);
+        let node = mesh_node(&MeshData { name: oname.clone(), verts, polys, poly_material: vec![0, 0], materials: vec![mt] });
+        let el = format!("{prefix}-{oname}.1-0");
+        std::fs::write(dir("MODELS")?.join(format!("{el}.hrc")), si_hrc::write_model(&node)).map_err(|e| e.to_string())?;
+        // a moving camera takes the marker along: its transformation at frame f is C_f C_still^-1, as for an object
+        let mut moved = false;
+        if let (Some(fr), Some(inv)) = (anim, anim::inverse(&fc.still)) {
+            let ms: Vec<Option<M4>> = fr.iter().map(|f| Some(f["camera"]["matrix_world"].clone()).filter(|v| !v.is_null()).map(|v| mat(&v))).collect();
+            if ms.iter().all(Option::is_some) {
+                let (mut s3, mut r3, mut t3) = ([vec![], vec![], vec![]], [vec![], vec![], vec![]], [vec![], vec![], vec![]]);
+                for mf in ms.iter().flatten() {
+                    let (s, r, tr) = anim::srt(&anim::to_si(&anim::mul(mf, &inv)));
+                    for k in 0..3 {
+                        s3[k].push(s[k]);
+                        r3[k].push(r[k]);
+                        t3[k].push(tr[k]);
+                    }
+                }
+                for v in r3.iter_mut() {
+                    anim::unwrap(v);
+                }
+                let mut curves = anim::group([1, 2, 3], s3);
+                curves.extend(anim::group([4, 5, 6], r3));
+                curves.extend(anim::group([139, 140, 141], t3));
+                if !curves.is_empty() {
+                    anim_rel.push(("MODELS", models.len(), anim_files.len(), 15000));
+                    anim_files.push((el.clone(), anim::ani_file("MODELS", &el, &curves, &frame_nums, fps)));
+                    moved = true;
+                }
+            }
+        }
+        report += &format!("depth of field: frame marker {oname}, two transparent triangles in the corner pixels at depths {:.2} and {:.2}{}\n", depths[0], depths[1], if moved { ", moving with the camera" } else { "" });
+        models.push(el);
+        model_src.push(String::new());
+    }
     // the lights of the soft shadows' arrays, one name a line, beside the database (not in it: the original never
     // reads it). render-frames answers their shadow rays in doubles where that is certain (unit softspeed1,
     // crates/si-render/src/softarray.rs); without the file (every Softimage database) nothing changes.
@@ -1440,5 +1573,49 @@ mod tests {
         let (a, b) = super::world_to_object(&id).unwrap();
         assert_eq!(a, [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
         assert!(b.iter().all(|&x| x == 0.0));
+    }
+
+    /// The depth of field's frame marker (unit dof2): each triangle inside its corner pixel, facing the camera, beyond the
+    /// scene's box along its ray and inside the clip.
+    #[test]
+    fn frame_marker_in_the_corner_pixels_behind_the_scene() {
+        let id: super::M4 = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]];
+        let fc = super::FrameCam { pos: [0.0, 0.5, 10.0], fwd: [0.0, 0.0, -1.0], up: [0.0, 1.0, 0.0], right: [1.0, 0.0, 0.0], tan_v: 0.3, aspect: 1.5, h: 640.0, near: 0.1, far: 100.0, still: id };
+        let (lo, hi) = ([-2.0, 0.0, -3.0], [2.0, 1.0, 3.0]);
+        let (v, t, d) = super::frame_marker(&fc, (lo, hi));
+        assert_eq!((v.len(), t.len()), (6, 2));
+        let (w, h) = (960.0, 640.0);
+        for (i, tri) in t.iter().enumerate() {
+            let p: Vec<[f64; 3]> = tri.iter().map(|c| v[c.vertex].map(|x| x as f64)).collect();
+            // facing the camera: the winding's normal against the view
+            let n = super::cross(super::add(p[1], p[0], -1.0), super::add(p[2], p[0], -1.0));
+            assert!(super::dot(n, fc.fwd) < 0.0);
+            assert!(tri.iter().all(|c| super::dot(c.normal.map(|x| x as f64), fc.fwd) < -0.999));
+            for q in &p {
+                let r = super::add(*q, fc.pos, -1.0);
+                let depth = super::dot(r, fc.fwd);
+                assert!((depth - d[i]).abs() < 1e-3 * d[i] && depth > fc.near && depth < fc.far);
+                // pixel coordinates, x from the left, y from the top
+                let px = (super::dot(r, fc.right) / depth / (fc.tan_v * fc.aspect) + 1.0) * w / 2.0;
+                let py = (1.0 - super::dot(r, fc.up) / depth / fc.tan_v) * h / 2.0;
+                let (cx, cy) = if i == 0 { (0.0, 0.0) } else { (w - 1.0, h - 1.0) };
+                assert!(px > cx && px < cx + 1.0 && py > cy && py < cy + 1.0, "{i}: {px} {py}");
+            }
+        }
+        // the bottom-right ray goes down through the box's floor (y = 0): the marker is beyond where it leaves the box
+        let dir_y = -fc.tan_v * (1.0 - 1.0 / h);
+        assert!(d[1] > (lo[1] - fc.pos[1]) / dir_y);
+        // the top-left ray: any depth inside the clip
+        assert!(d[0] > fc.near && d[0] < fc.far);
+    }
+
+    /// The cap on the blur grows with the picture (16 samples per 960 pixels, at most 32): a 1920 picture gets about the
+    /// blur of a 960 one, not half of it (unit dof2).
+    #[test]
+    fn dof_cap_scales_with_the_picture() {
+        let at = |px: f64| super::dof_fit(50.0, 36.0, px, 15.0, 0.7, 1.0, 0.1).unwrap().half;
+        assert!(at(960.0) <= 16);
+        assert!(at(1920.0) > 16 && at(1920.0) <= 32);
+        assert!(at(3840.0) <= 32);
     }
 }

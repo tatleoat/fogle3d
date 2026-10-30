@@ -21,10 +21,12 @@
 //! reads); render-frames answers their shadow rays first with a bounding volume hierarchy in doubles and keeps the
 //! answer only where it is certainly the walk's (crates/si-render/src/softarray.rs). Rays from nearby points to the
 //! lights of one array share a shaft (unit softspeed3): the triangles that can cut any ray from a small box of points
-//! to the array's lights are listed once, so most rays test a few triangles instead of descending the hierarchy. The
-//! picture is the same (byte-identical to the walk's; the check mode found 0 disagreements in 27.3 million rays); at
-//! 24 lights the still life takes about 22% less CPU time (19-26% over four runs) than with the walk alone. A database
-//! without the file, every Softimage scene's, is rendered as before.
+//! to the array's lights are listed once, so most rays test a few triangles instead of descending the hierarchy. Unit
+//! soft4: each triangle is tested as the walk tests it (in doubles, with error bounds), rays through glass get the
+//! walk's factor directly, and a single light with ray-traced shadows is listed too (an array of one). The picture is
+//! the same (byte-identical to the walk's; the check mode found 0 disagreements in 14.07 million rays at 480x320);
+//! the still life at 1920x1280 took 24.3 s wall, 369 CPU s at 16 threads before unit soft4, 16.3 s and 241 CPU s
+//! after (14.9 s at 21 threads). A database without the file, every Softimage scene's, is rendered as before.
 //!
 //! What stays different from Cycles (re/tools/soft1, calib): the renderer adds lights in display values, so a light
 //! half hidden leaves half the display value where Cycles' leaves about 73% (linear half, sRGB-encoded): penumbrae are

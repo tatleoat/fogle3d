@@ -33,7 +33,11 @@ STATEFUL = [
     (range(800, 808), "dynamics"),
 ]
 
+# processes of an animation render (each holds its own pictures and database copy): at most 16
 MAX_THREADS = 16
+# band threads of a still (one process; fit_threads lowers them when memory is short): up to all cores but one (unit
+# soft4: the still life at 1920x1280 renders in 16.3 s with 16 threads, 14.9 s with 21 on 22 cores)
+MAX_BAND_THREADS = 64
 
 
 def usable_cores():
@@ -43,9 +47,10 @@ def usable_cores():
         return os.cpu_count() or 1
 
 
-def auto_count(cores=None):
-    """Default process / thread count: all cores but one, never above MAX_THREADS."""
-    return max(1, min(MAX_THREADS, (cores or usable_cores()) - 1))
+def auto_count(cores=None, cap=MAX_THREADS):
+    """Default process / thread count: all cores but one, never above `cap` (MAX_THREADS, or MAX_BAND_THREADS for a
+    still's band threads)."""
+    return max(1, min(cap, (cores or usable_cores()) - 1))
 
 
 def stateful_reasons(dsc):

@@ -52,7 +52,7 @@ class SI3DPreferences(bpy.types.AddonPreferences):
                                        "to frame (others run in one process). 0 = all cores but one, at most 16")
     band_threads: IntProperty(name="Band threads", default=0, min=0, max=64,
                               description="Threads inside one frame (RENDER_THREADS; same pictures as one thread). "
-                                          "0 = all cores but one, at most 16, for a still image; 1 for animations")
+                                          "0 = all cores but one for a still image (fewer when memory is short); 1 for animations")
     memory_mb: IntProperty(name="Memory per process (MB)", default=0, min=0, max=256000,
                            description="Address-space cap of each renderer process (ulimit -v; env SI3D_MEM_MB). "
                                        "0 = automatic: 2000 MB plus about 600 MB per million pixels of the picture and 128 MB "

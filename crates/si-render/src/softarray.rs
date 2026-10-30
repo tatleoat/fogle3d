@@ -1,27 +1,39 @@
 // SPDX-License-Identifier: MIT
-//! Shadow rays of the add-on's light arrays (unit softspeed1; our own code, nothing here reproduces a function of the
-//! original).
+//! Shadow rays of the add-on's light arrays (unit softspeed1, unit soft4; our own code, nothing here reproduces a
+//! function of the original).
 //!
 //! blend2db writes a Blender light with a size as an array of n lights with ray-traced shadows (unit soft1,
-//! re/tools/builder2/blend2db/src/soft.rs) and lists their names in `soft-arrays.txt` beside the database (a file the
-//! original never writes or reads). For those lights only, the shadow ray is first answered in doubles (the
-//! original's walk tests every triangle listed in every cell the ray crosses: about 3.5 microseconds a shadow ray on the
-//! gallery's still life, 80% of its render time with a 49-light array), in two ways:
+//! re/tools/builder2/blend2db/src/soft.rs), and a single light with ray-traced shadows as an array of one (unit soft4),
+//! and lists their names in `soft-arrays.txt` beside the database (a file the original never writes or reads). For
+//! those lights only, the shadow ray is first answered in doubles (the original's walk tests every triangle listed in
+//! every cell the ray crosses: about 2.3 microseconds a shadow ray on the gallery's still life, against 0.9 here), in
+//! two ways:
 //! - [`Bvh::shaft_hit`]: the n shadow rays of one shaded point to one array come one after the other, so the triangles
 //!   near any of them (near the convex hull of the point and the array's lights, the "shaft") are found once, and each
-//!   ray tests only those (4.4 on average on the still life: 79% of its array rays are answered this way);
-//! - [`Bvh::any_hit`], for a shaft with too many triangles (a point behind a detailed model) or a ray outside its shaft:
-//!   a bounding volume hierarchy (surface-area split) over the triangles of the frame's BSP tree, built once per frame.
+//!   ray tests only those (4.5 on average on the still life: 76% of its array rays are answered this way);
+//! - [`Bvh::any_hit`], for a shaft with more than [`MAX_CANDIDATES`] triangles (a point behind a detailed model), a ray
+//!   outside its shaft, or a light that is an array of one: a bounding volume hierarchy (surface-area split) over the
+//!   triangles of the frame's BSP tree, built once per frame.
 //!
-//! The answer is used only when it is certain to be the original's: "clear" (no triangle near the segment from the
-//! point to the light) or "opaque" (an opaque triangle certainly hit nearer than any triangle that is transparent or
-//! within a margin of a hit). Every other ray (a transparent occluder, a ray within the margin of a triangle's edge or
-//! of the segment's ends, a light of a selective set) is traced by the original's walk (`trace::s_trace`). The factor
-//! is then the one `s_trace` returns: 1, or the umbra. `SOFTARRAY_CHECK=1` walks every ray too and counts: on the still
-//! life (480x320, 49 lights) 27.3 million rays, 0 where a certain answer differs from the walk's. What differs: the ray
-//! counter and the "met" marks of the triangles the original's walk would have left (neither is read before it is set
-//! again), and a transparent triangle's material adjusted by a walk that ended at an opaque one behind it (the original
-//! returns the umbra there too).
+//! Each triangle near the ray is tested by [`hit`], the walk's own test (render.rs `exact_hit`, the port of the
+//! original's `SI_Intersect`) repeated in doubles with a rigorous bound on how far the walk's extended-precision result
+//! can be from it: Miss, Sure (the walk meets it, at a distance known within the bound) or Near (the walk decides).
+//! [`Bvh::decide`] then follows the walk: it meets the triangles nearest first, each at least 0.0001 (trace.rs `SHADOW_PAST`) past
+//! the one before, and stops at the first opaque one. The answer is used only when it is certain to be the walk's:
+//! Clear (nothing met), Opaque (an opaque triangle met, the factor the umbra) or Through (only transparent triangles
+//! whose material the walk does not change, at most 8: the factor computed by [`through`] with the walk's operations
+//! in the walk's order and precision). Every other ray (a Near triangle on the way, gaps the bounds cannot order, a
+//! textured or vertex-coloured transparent material, a light of a selective set) is traced by the original's walk
+//! (`trace::s_trace`). The test `the_test_answers_as_the_walks` holds [`hit`] against the walk's test
+//! (`render::probe`) on 200,000 random and borderline cases: 0 errors (a mutation with the bounds set to zero fails).
+//!
+//! `SOFTARRAY_CHECK=1` walks every ray too, uses the walk's factor, and counts. On the still life at 480x320 (an
+//! array of 24 lights and one shadowed point light): 14.07 million rays, of which 11.86 million clear, 0.49 million
+//! opaque and 1.71 million through transparent triangles agreed with the walk bit for bit, 0 disagreed, 5,912 were
+//! left to the walk (0.04%). What differs from the original's run: the ray counter and the "met" marks of the
+//! triangles the walk would have left (neither is read before it is set again), and a transparent triangle's material
+//! adjusted by a walk that ended at an opaque one behind it (the original returns the umbra there too). Speed on the
+//! still life, 480x320, one thread: 16.9 s with the walk for every ray, about 10.3 s with these answers.
 //!
 //! Lights of a database without the file, every Softimage scene's, are traced as before, and no hierarchy is built.
 
@@ -40,24 +52,45 @@ static MEMBERS: RwLock<Option<HashMap<Vec<u8>, u32>>> = RwLock::new(None);
 /// answers that the walk agrees and disagrees with.
 static CHECK: OnceLock<bool> = OnceLock::new();
 /// clear agreed, opaque agreed, disagreed, unsure; ns of the hierarchy and of the walk; rays answered from a shaft's
-/// candidates, rays of a shaft with too many (per ray), rays leaving their shaft (per ray); shafts built, their candidates
-static COUNTS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+/// candidates, rays of a shaft with too many (per ray), rays leaving their shaft (per ray); shafts built, their
+/// candidates; rays through transparent triangles agreed (unit soft4), of them through more than one; rays to an
+/// array of one light (unit soft4)
+static COUNTS: [AtomicU64; 14] = [const { AtomicU64::new(0) }; 14];
+
+/// Under [`checking`]: why [`Bvh::decide`] left a ray unsure: too many transparent triangles, one after the opaque one
+/// too close, one within the margins before the walk stops, gaps, materials, the triangle shaded.
+static WHY: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+fn why(k: usize) -> Seen {
+    if checking() {
+        WHY[k].fetch_add(1, Ordering::Relaxed);
+    }
+    Seen::Unsure
+}
 
 /// Whether `SOFTARRAY_CHECK` is set to 1.
 pub fn checking() -> bool {
     *CHECK.get_or_init(|| std::env::var("SOFTARRAY_CHECK").is_ok_and(|v| v == "1"))
 }
 
-/// Counts one ray under [`checking`]: the hierarchy's answer and the factor the walk returned; `umbra` is the light's;
-/// the nanoseconds the hierarchy and the walk took.
-pub fn record(seen: Seen, walk: [f32; 4], umbra: f32, ns: (u64, u64)) {
+/// Counts one ray under [`checking`]: the hierarchy's answer (`mine`, the factor it gives; none when unsure) against
+/// the factor the walk returned, bit for bit; the nanoseconds the hierarchy and the walk took; `passes` the
+/// transparent triangles of a [`Seen::Through`].
+pub fn record(seen: Seen, mine: Option<[f32; 4]>, walk: [f32; 4], passes: usize, ns: (u64, u64)) {
     COUNTS[4].fetch_add(ns.0, Ordering::Relaxed);
     COUNTS[5].fetch_add(ns.1, Ordering::Relaxed);
+    let same = mine.is_some_and(|m| m.iter().zip(walk.iter()).all(|(a, b)| a.to_bits() == b.to_bits()));
     let k = match seen {
         Seen::Unsure => 3,
-        Seen::Clear if walk[..3] == [1.0; 3] => 0,
-        Seen::Opaque if walk[..3] == [umbra; 3] => 1,
-        _ => 2,
+        _ if !same => 2,
+        Seen::Clear => 0,
+        Seen::Opaque => 1,
+        Seen::Through => {
+            if passes > 1 {
+                COUNTS[12].fetch_add(1, Ordering::Relaxed);
+            }
+            11
+        }
     };
     COUNTS[k].fetch_add(1, Ordering::Relaxed);
 }
@@ -66,11 +99,15 @@ pub fn record(seen: Seen, walk: [f32; 4], umbra: f32, ns: (u64, u64)) {
 pub fn report() -> Option<String> {
     checking().then(|| {
         let c = COUNTS.each_ref().map(|c| c.load(Ordering::Relaxed));
-        let rays = (c[0] + c[1] + c[2] + c[3]).max(1) as f64;
+        let rays = (c[0] + c[1] + c[2] + c[3] + c[11]).max(1) as f64;
         format!(
-            "softarray check: clear agreed {}, opaque agreed {}, DISAGREED {}, unsure (walked) {}; ns a ray: hierarchy {:.0}, walk {:.0}; \
-             shaft rays {}, per ray (many) {}, left the shaft {}; shafts {}, candidates a shaft {:.1}",
-            c[0], c[1], c[2], c[3], c[4] as f64 / rays, c[5] as f64 / rays, c[6], c[7], c[8], c[9], c[10] as f64 / c[9].max(1) as f64
+            "softarray check: clear agreed {}, opaque agreed {}, through transparent agreed {} (of them through 2 or more {}), \
+             DISAGREED {}, unsure (walked) {}; ns a ray: hierarchy {:.0}, walk {:.0}; \
+             shaft rays {}, per ray (many) {}, left the shaft {}, single light {}; shafts {}, candidates a shaft {:.1}; \
+             unsure why: many {}, after the opaque {}, near {}, gap {}, material {}, shaded {}",
+            c[0], c[1], c[11], c[12], c[2], c[3], c[4] as f64 / rays, c[5] as f64 / rays, c[6], c[7], c[8], c[13], c[9], c[10] as f64 / c[9].max(1) as f64,
+            WHY[0].load(Ordering::Relaxed), WHY[1].load(Ordering::Relaxed), WHY[2].load(Ordering::Relaxed),
+            WHY[3].load(Ordering::Relaxed), WHY[4].load(Ordering::Relaxed), WHY[5].load(Ordering::Relaxed)
         )
     })
 }
@@ -104,23 +141,43 @@ pub fn group(name: &[u8]) -> u32 {
     MEMBERS.read().ok().and_then(|m| m.as_ref().and_then(|s| s.get(name).copied())).unwrap_or(0)
 }
 
-/// What [`any_hit`] makes of a shadow ray.
+/// What [`Bvh::any_hit`] makes of a shadow ray.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Seen {
     Clear,
     Opaque,
     Unsure,
+    /// Through transparent triangles only, all certainly met, in the order and with the materials [`Passes`] lists
+    /// (unit soft4): the walk's factor is [`through`]'s.
+    Through,
 }
 
-/// One triangle of the hierarchy: its first corner, two edges, the normal (edge 1 x edge 2), its length, the longest
-/// edge, the triangle's index and whether it is opaque (none of the flags 0x340).
+/// The most transparent triangles a [`Seen::Through`] answer lists (a ray through a glass and a ball meets 2 to 6).
+pub const PASS_MAX: usize = 8;
+
+/// The transparent triangles (their indices in the frame's triangle list) a shadow ray passes, nearest first, when the
+/// answer is [`Seen::Through`]; the walk would meet each of them and only them.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Passes {
+    pub n: usize,
+    pub tn: [usize; PASS_MAX],
+}
+
+/// One triangle of the hierarchy: its first corner and two edges (for the boxes and shafts); what the original's test
+/// reads of it ([`hit`]): the stored plane (normal and distance), the normal's component along the dominant axis, the
+/// two axes (a, b) of the plane the weights are measured in, and for the three weights the corner and edge they are
+/// measured from, as (a, b) pairs; the triangle's index and whether it is opaque (none of the flags 0x340).
 struct Tri {
     a: [f64; 3],
     e1: [f64; 3],
     e2: [f64; 3],
     n: [f64; 3],
-    nl: f64,
-    longest: f64,
+    d: f64,
+    nk: f64,
+    ia: usize,
+    ib: usize,
+    wc: [[f64; 2]; 3],
+    we: [[f64; 2]; 3],
     tn: usize,
     opaque: bool,
 }
@@ -139,8 +196,13 @@ struct Node {
 pub struct Bvh {
     nodes: Vec<Node>,
     tris: Vec<Tri>,
+    /// a triangle's index (in the frame's list) to its place in `tris`, u32::MAX for one the walk never meets
+    index: Vec<u32>,
     /// the largest coordinate (in size) of a corner: the scale of the original's rounding errors
     extent: f64,
+    /// by array number: whether the array has one light only (blend2db lists a single light with ray-traced shadows as
+    /// an array of one, unit soft4), whose rays skip the shaft
+    single: Vec<bool>,
 }
 
 const LEAF: usize = 2;
@@ -169,7 +231,17 @@ impl Bvh {
                 }
             }
         }
-        Bvh::build(&st.tns, &st.verts, &list).map(std::sync::Arc::new)
+        let mut b = Bvh::build(&st.tns, &st.verts, &list)?;
+        let mut count = Vec::new();
+        for l in st.lights.iter().filter(|l| l.array != 0) {
+            let g = l.array as usize;
+            if count.len() <= g {
+                count.resize(g + 1, 0u32);
+            }
+            count[g] += 1;
+        }
+        b.single = count.iter().map(|&n| n == 1).collect();
+        Some(std::sync::Arc::new(b))
     }
 
     /// The hierarchy over the triangles `list` (a triangle without three corners: none).
@@ -183,10 +255,22 @@ impl Bvh {
             }
             let c = |k: usize| t.v[k].and_then(|j| verts.get(j)).map(|v| [v.world.x as f64, v.world.y as f64, v.world.z as f64]);
             let (a, b, c) = (c(0)?, c(1)?, c(2)?);
-            let (e1, e2, e3) = (sub(b, a), sub(c, a), sub(c, b));
-            let n = cross(e1, e2);
-            let longest = dot(e1, e1).max(dot(e2, e2)).max(dot(e3, e3)).sqrt();
-            tris.push(Tri { a, e1, e2, n, nl: dot(n, n).sqrt(), longest, tn: i, opaque: t.flags & 0x340 == 0 });
+            // the original's test (render.rs `weights`): axis 1 measures in (z, y), 2 in (x, z), 3 in (y, x)
+            let (ia, ib) = match t.axis {
+                1 => (2, 1),
+                2 => (0, 2),
+                _ => (1, 0),
+            };
+            let nk = match t.axis {
+                1 => t.n.x,
+                2 => t.n.y,
+                _ => t.n.z,
+            } as f64;
+            let v3 = |v: Vector| [v.x as f64, v.y as f64, v.z as f64];
+            let ab = |p: [f64; 3]| [p[ia], p[ib]];
+            let wc = [ab(b), ab(c), ab(a)];
+            let we = t.edge.map(|e| ab(v3(e)));
+            tris.push(Tri { a, e1: sub(b, a), e2: sub(c, a), n: v3(t.n), d: t.d as f64, nk, ia, ib, wc, we, tn: i, opaque: t.flags & 0x340 == 0 });
         }
         let bound = |t: &Tri| {
             let mut lo = t.a;
@@ -303,18 +387,25 @@ impl Bvh {
             todo.push(child);
             todo.push(child + 1);
         }
-        Some(Bvh { nodes, tris, extent })
+        let mut index = vec![u32::MAX; tns.len()];
+        for (i, t) in tris.iter().enumerate() {
+            index[t.tn] = i as u32;
+        }
+        Some(Bvh { nodes, tris, index, extent, single: Vec::new() })
     }
 
-    /// The margin, a length: 2e-6 of the largest coordinate of the scene or the ray's origin. The original computes
-    /// the plane, the distance and the point from floats (6e-8 of their size), so its hit points lie well within it.
+    /// The margin, a length: 2e-6 of the largest coordinate of the scene or the ray's origin (plus 2e-6). The point the
+    /// original's test takes for a hit lies on its stored plane and inside its stored edges, both from floats (6e-8
+    /// of their size), so well within it of the triangle: the boxes and shafts are widened by it.
     fn margin(&self, o: [f64; 3]) -> f64 {
-        2e-6 * (1.0 + o.iter().fold(self.extent, |m, v| m.max(v.abs())))
+        2e-6 * (1.0 + self.extent.max(size(o)))
     }
 
     /// The shadow ray from `o` along `d` (as `s_trace` gets it: `d` the unit direction to the light, `tmax` its
-    /// distance, `tmin` 0.0001, `from` the triangle shaded).
-    pub fn any_hit(&self, o: Vector, d: Vector, from: usize, tmin: f32, tmax: f32) -> Seen {
+    /// distance, `tmin` 0.0001, `from` the triangle shaded). A [`Seen::Through`] answer lists its triangles in `pass`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn any_hit(&self, st: &ShadeState, o: Vector, d: Vector, from: usize, tmin: f32, tmax: f32, pass: &mut Passes) -> Seen {
+        pass.n = 0;
         let o = [o.x as f64, o.y as f64, o.z as f64];
         let d = [d.x as f64, d.y as f64, d.z as f64];
         let (tmin, tmax) = (tmin as f64, tmax as f64);
@@ -323,9 +414,8 @@ impl Bvh {
         }
         let e = self.margin(o);
         let inv = d.map(|c| if c.abs() > 1e-12 { 1.0 / c } else { 0.0 });
-        let mut t_op = f64::INFINITY; // nearest opaque triangle certainly hit
-        let mut t_un = f64::INFINITY; // nearest triangle that is transparent or within the margin of a hit
-        // the part of the segment a box must meet: [tmin - e, the nearest answer so far (or tmax) + e]
+        let mut g = Gather::new();
+        // the part of the segment a box must meet: [tmin - e, the horizon (or tmax) + e]
         let enter = |n: &Node, t_end: f64| -> Option<f64> {
             let (mut t0, mut t1) = (tmin - e, t_end + e);
             for k in 0..3 {
@@ -347,20 +437,17 @@ impl Bvh {
         while sp > 0 {
             sp -= 1;
             let n = &self.nodes[stack[sp] as usize];
-            let t_end = t_op.min(t_un).min(tmax);
+            let t_end = g.horizon().min(tmax);
             if enter(n, t_end).is_none() {
                 continue;
             }
             if n.count > 0 {
-                for t in &self.tris[n.first as usize..(n.first + n.count) as usize] {
+                for i in n.first..n.first + n.count {
+                    let t = &self.tris[i as usize];
                     if t.tn == from {
                         continue;
                     }
-                    match hit(o, d, t, tmin, tmax, e) {
-                        Hit::Miss => {}
-                        Hit::Sure(h) if t.opaque => t_op = t_op.min(h),
-                        Hit::Sure(h) | Hit::Near(h) => t_un = t_un.min(h),
-                    }
+                    g.add(hit(o, d, t, tmin, tmax), t, i);
                 }
                 continue;
             }
@@ -369,7 +456,7 @@ impl Bvh {
             }
             // the nearer child is looked at first
             let (c0, c1) = (n.first, n.first + 1);
-            let t_end = t_op.min(t_un).min(tmax);
+            let t_end = g.horizon().min(tmax);
             let (a, b) = (enter(&self.nodes[c0 as usize], t_end), enter(&self.nodes[c1 as usize], t_end));
             match (a, b) {
                 (Some(a), Some(b)) => {
@@ -389,7 +476,85 @@ impl Bvh {
                 (None, None) => {}
             }
         }
-        answer(t_op, t_un)
+        self.decide(st, &mut g, o, d, from, tmax, pass)
+    }
+
+    /// The answer from what the triangles near a ray gave (unit soft4; before, any transparent triangle met made the
+    /// ray unsure). The walk meets the triangles along the ray nearest first, each at least 0.0001 (trace.rs `SHADOW_PAST`) past the
+    /// one before (`tmin` becomes the hit's distance plus 0.0001), and stops at the first opaque one. The answer is
+    /// certain when every triangle it would meet up to there is certainly met, in an order and with gaps that the
+    /// margins cannot change, no triangle within the margins could be met before it stops, and what the walk does at
+    /// a transparent triangle changes nothing but the factor ([`plain`]): then Opaque (an opaque one is met), Through
+    /// (transparent ones only, listed in `pass`) or Clear.
+    #[allow(clippy::too_many_arguments)]
+    fn decide(&self, st: &ShadeState, g: &mut Gather, o: [f64; 3], d: [f64; 3], from: usize, tmax: f64, pass: &mut Passes) -> Seen {
+        pass.n = 0;
+        if g.overflow {
+            return why(0);
+        }
+        let tr = &mut g.tr[..g.n];
+        for i in 1..tr.len() {
+            let mut j = i;
+            while j > 0 && tr[j - 1].0 > tr[j].0 {
+                tr.swap(j - 1, j);
+                j -= 1;
+            }
+        }
+        let (op, et_op) = g.op;
+        // the transparent triangles before the opaque one (all of them without one)
+        let k = tr.iter().take_while(|h| h.0 < op).count();
+        if op.is_finite() {
+            // one met after the opaque one must be certainly after it
+            if let Some(&(h, et, _)) = tr.get(k) {
+                if !(h - et > op + et_op + order(h)) {
+                    return why(1);
+                }
+            }
+        }
+        // a triangle within the margins that the walk may meet before it stops (without an opaque one: anywhere)
+        let end = if op.is_finite() { op + et_op + order(op) } else { f64::INFINITY };
+        if g.near.is_finite() && !(g.near > end) {
+            return why(2);
+        }
+        if k > PASS_MAX {
+            return why(0);
+        }
+        // nearest first, each certainly SHADOW_PAST past the one before
+        let mut prev: Option<(f64, f64)> = None;
+        for (h, et) in tr[..k].iter().map(|h| (h.0, h.1)).chain(op.is_finite().then_some((op, et_op))) {
+            if let Some((ph, pet)) = prev {
+                if !(h - et > ph + pet + SHADOW_PAST + order(h)) {
+                    return why(3);
+                }
+            }
+            prev = Some((h, et));
+        }
+        if k > 0 {
+            for &(_, _, i) in tr[..k].iter() {
+                if !plain(st, self.tris[i as usize].tn) {
+                    return why(4);
+                }
+            }
+            // after the first one the walk no longer leaves out the triangle shaded: it must lie certainly before (the
+            // walk's next tmin is float(float(t) + 0.0001))
+            let (h1, et1) = (tr[0].0, tr[0].1);
+            if let Some(&j) = self.index.get(from) {
+                if j != u32::MAX && !matches!(hit(o, d, &self.tris[j as usize], h1 - et1 - order(h1) + SHADOW_PAST, tmax), Hit::Miss) {
+                    return why(5);
+                }
+            }
+        }
+        if op.is_finite() {
+            return Seen::Opaque;
+        }
+        if k == 0 {
+            return Seen::Clear;
+        }
+        pass.n = k;
+        for (s, h) in pass.tn.iter_mut().zip(tr[..k].iter()) {
+            *s = self.tris[h.2 as usize].tn;
+        }
+        Seen::Through
     }
 
     /// The shadow ray of light `light` (a member of array `st.lights[light].array`) from `o` along `d`, as
@@ -399,10 +564,18 @@ impl Bvh {
     /// shaft with more than [`MAX_CANDIDATES`] (a point behind a detailed model), a point whose lights are spread over
     /// more than 60 degrees, or a ray that leaves its shaft, is answered by [`Bvh::any_hit`].
     #[allow(clippy::too_many_arguments)]
-    pub fn shaft_hit(&self, sh: &mut Shaft, st: &ShadeState, light: usize, o: Vector, d: Vector, from: usize, tmin: f32, tmax: f32) -> Seen {
+    pub fn shaft_hit(&self, sh: &mut Shaft, st: &ShadeState, light: usize, o: Vector, d: Vector, from: usize, tmin: f32, tmax: f32, pass: &mut Passes) -> Seen {
+        pass.n = 0;
         let group = st.lights[light].array;
-        let key = ([o.x.to_bits(), o.y.to_bits(), o.z.to_bits()], from, group);
         let check = checking();
+        if self.single.get(group as usize).copied().unwrap_or(false) {
+            // one light: the shaft is its ray
+            if check {
+                COUNTS[13].fetch_add(1, Ordering::Relaxed);
+            }
+            return self.any_hit(st, o, d, from, tmin, tmax, pass);
+        }
+        let key = ([o.x.to_bits(), o.y.to_bits(), o.z.to_bits()], from, group);
         if sh.key != Some(key) {
             sh.key = Some(key);
             self.build_shaft(sh, st, group, [o.x as f64, o.y as f64, o.z as f64], from);
@@ -418,7 +591,7 @@ impl Bvh {
             if check {
                 COUNTS[7].fetch_add(1, Ordering::Relaxed);
             }
-            return self.any_hit(o, d, from, tmin, tmax);
+            return self.any_hit(st, o, d, from, tmin, tmax, pass);
         }
         let e = self.margin(o64);
         // the segment the hierarchy looks at, [tmin - e, tmax + e], must lie inside the shaft (widened by m / 2): its
@@ -428,21 +601,17 @@ impl Bvh {
             if check {
                 COUNTS[8].fetch_add(1, Ordering::Relaxed);
             }
-            return self.any_hit(o, d, from, tmin, tmax);
+            return self.any_hit(st, o, d, from, tmin, tmax, pass);
         }
         if check {
             COUNTS[6].fetch_add(1, Ordering::Relaxed);
         }
-        let (mut t_op, mut t_un) = (f64::INFINITY, f64::INFINITY);
+        let mut g = Gather::new();
         for &i in &sh.cand {
             let t = &self.tris[i as usize];
-            match hit(o64, d64, t, lo, hi, e) {
-                Hit::Miss => {}
-                Hit::Sure(h) if t.opaque => t_op = t_op.min(h),
-                Hit::Sure(h) | Hit::Near(h) => t_un = t_un.min(h),
-            }
+            g.add(hit(o64, d64, t, lo, hi), t, i);
         }
-        answer(t_op, t_un)
+        self.decide(st, &mut g, o64, d64, from, hi, pass)
     }
 
     /// Fills `sh` for the point `p` (triangle `from` left out) and the lights of array `group`: planes (x - p) . n <= b
@@ -581,59 +750,195 @@ fn dot(p: [f64; 3], q: [f64; 3]) -> f64 {
     p[0] * q[0] + p[1] * q[1] + p[2] * q[2]
 }
 
-fn answer(t_op: f64, t_un: f64) -> Seen {
-    if t_un.is_finite() && t_un <= t_op {
-        Seen::Unsure
-    } else if t_op.is_finite() {
-        Seen::Opaque
-    } else {
-        Seen::Clear
+/// The walk's step past a transparent triangle it met (trace.rs: `tmin` becomes the hit's distance plus 0.0001).
+const SHADOW_PAST: f64 = 1e-4;
+
+/// The largest coordinate of `p` in size.
+fn size(p: [f64; 3]) -> f64 {
+    p.iter().fold(0.0f64, |m, v| m.max(v.abs()))
+}
+
+/// Beyond the nearest opaque triangle (or the first place a triangle within the margins may be met), by this much,
+/// nothing found changes the answer: [`Gather::horizon`].
+const PRUNE: f64 = 1e-3;
+
+/// The most transparent triangles [`Gather`] keeps for one ray; more: unsure.
+const TR_MAX: usize = 16;
+
+/// Slack for the rounding of a distance to a float (the walk keeps `t` and `tmin` as floats).
+fn order(h: f64) -> f64 {
+    1e-6 * (1.0 + h.abs())
+}
+
+/// What the triangles tested against one shadow ray gave ([`hit`]).
+struct Gather {
+    /// the nearest opaque triangle certainly met: distance and its margin (infinite: none)
+    op: (f64, f64),
+    /// the least distance from which a triangle within the margins may be met (infinite: none)
+    near: f64,
+    /// the transparent triangles certainly met: distance, margin, index in [`Bvh::tris`]
+    tr: [(f64, f64, u32); TR_MAX],
+    n: usize,
+    overflow: bool,
+}
+
+impl Gather {
+    fn new() -> Gather {
+        Gather { op: (f64::INFINITY, 0.0), near: f64::INFINITY, tr: [(0.0, 0.0, 0); TR_MAX], n: 0, overflow: false }
     }
+
+    #[inline(always)]
+    fn add(&mut self, r: Hit, t: &Tri, i: u32) {
+        match r {
+            Hit::Miss => {}
+            Hit::Sure(h, et) if t.opaque => {
+                if h < self.op.0 {
+                    self.op = (h, et);
+                }
+            }
+            Hit::Sure(h, et) => {
+                if self.n < TR_MAX {
+                    self.tr[self.n] = (h, et, i);
+                    self.n += 1;
+                } else {
+                    self.overflow = true;
+                }
+            }
+            Hit::Near(lo) => self.near = self.near.min(lo),
+        }
+    }
+
+    /// The distance beyond which no triangle changes the answer: [`PRUNE`] past the nearest opaque triangle's margin or
+    /// the first place a triangle within the margins may be met.
+    fn horizon(&self) -> f64 {
+        (self.op.0 + self.op.1).min(self.near) + PRUNE
+    }
+}
+
+/// Whether the walk, meeting the transparent triangle `tn`, changes nothing but its factor: no vertex colours (which
+/// set the material's working colours from the hit point), no texture stage (flag 0x400: `shadow_map`), no static
+/// blur (a factor from the hit's normal). The factor then reads only the material's working opacity and diffuse
+/// colour, as they are when the ray is traced ([`through`]).
+fn plain(st: &ShadeState, tn: usize) -> bool {
+    st.tns.get(tn).is_some_and(|t| {
+        t.flags & 0x400 == 0 && st.materials.get(t.material as usize).is_some_and(|m| m.vcol_rgb == 1 && m.vcol_alpha == 1 && m.static_blur == 0)
+    })
+}
+
+/// The factor the walk returns for a [`Seen::Through`] ray of light `light` (unit soft4): for each transparent
+/// triangle of `pass`, nearest first, its material's share as `trace::s_trace_walk` computes it (flags 0x300: one
+/// minus the working opacity, below a half twice that times the diffuse colour, above it a blend towards white; the
+/// static blur factor is 1 for [`plain`] materials), then the umbra blend of a ray that passed something. The same
+/// operations in the same order and precision as the walk's, so the same bits (`SOFTARRAY_CHECK=1` compares them).
+pub fn through(st: &ShadeState, light: usize, pass: &Passes) -> [f32; 4] {
+    use si_x87::{fmov, x, F80};
+    const SHADOW_HALF: f64 = 0.5;
+    let umbra = fmov(st.lights[light].umbra);
+    let blur = 1.0f32;
+    let mut left = [1.0f32; 3];
+    for &hit in &pass.tn[..pass.n] {
+        let flags = st.tns[hit].flags;
+        let m = &st.materials[st.tns[hit].material as usize];
+        if flags & 0x300 != 0 || m.static_blur != 0 {
+            let k = (F80::ONE - x(blur) * m.work.opacity).to_f32();
+            let k = if x(k).lt(x(0.0f32)) { x(0.0f32) } else { x(k) };
+            if x(SHADOW_HALF).gt(k) {
+                let k2 = (k + k).to_f32();
+                for i in 0..3 {
+                    left[i] = ((x(k2) * m.work.diffuse[i]) * left[i]).to_f32();
+                }
+            } else {
+                let w = ((k - SHADOW_HALF) + (k - SHADOW_HALF)).to_f32();
+                let rest = F80::ONE - x(w);
+                for i in 0..3 {
+                    left[i] = ((rest * m.work.diffuse[i] + w) * left[i]).to_f32();
+                }
+            }
+        }
+    }
+    if pass.n > 0 {
+        let a = (F80::ONE - x(umbra)).to_f32();
+        for f in &mut left {
+            *f = (x(a) * *f + umbra).to_f32();
+        }
+    }
+    [left[0], left[1], left[2], st.glb.unset]
 }
 
 enum Hit {
     Miss,
-    /// certainly a hit at this distance, within the segment
-    Sure(f64),
-    /// within the margin of a hit (of an edge, of the segment's ends, or nearly parallel): the original's walk decides
+    /// certainly a hit, at this distance (the walk's within the bound given), its float below the light's distance
+    Sure(f64, f64),
+    /// the walk may or may not meet it (a weight, the distance or its float too close to a limit to tell, or nearly
+    /// parallel): the original's walk decides; the least distance from which it may meet it
     Near(f64),
 }
 
-/// Möller and Trumbore's test in doubles, with the margin `e` (a length) widened where the ray meets the plane at a
-/// slant: a point within e / cos of an edge, or a distance within e / cos of the segment's ends, is near.
+/// 2^-53, the unit roundoff of a double.
+const U: f64 = 1.0 / 9_007_199_254_740_992.0;
+
+/// The original's |direction . normal| below which a triangle is parallel to the ray (render.rs).
+const PARALLEL: f64 = 1e-8;
+
+/// What the walk's test of triangle `t` (render.rs `exact_hit`, the port of the original's `SI_Intersect`) gives on
+/// the ray from `o` along `d` (floats) with `tmin` (as the walk has it) and the light's distance `tmax`: the same
+/// formula on the same stored floats (the triangle's plane normal and distance, its edges and corners), computed in
+/// doubles with a bound on how far the walk's extended result can be from it, as render.rs `certain_miss` bounds it
+/// (the products of two floats are exact in a double; each sum's result is within its roundings times the sum of its
+/// terms' sizes, in a double as in an extended; the bounds take twice that and more). A hit needs |d . n| not below
+/// 1e-8, the distance t not below tmin, the point o + float(t) d inside the three weights, and (the walk's test
+/// against the light) float(t) below `tmax`. Sure or Miss only where the bounds decide every step.
 #[inline(always)]
-fn hit(o: [f64; 3], d: [f64; 3], t: &Tri, tmin: f64, tmax: f64, e: f64) -> Hit {
-    if !(t.nl > 0.0) {
-        return Hit::Miss; // no plane: |d . N| is 0, which the original's test takes for a miss
-    }
-    let pv = cross(d, t.e2);
-    let det = dot(t.e1, pv);
-    let tv = [o[0] - t.a[0], o[1] - t.a[1], o[2] - t.a[2]];
-    let cos = det.abs() / t.nl;
-    if cos < 1e-4 {
-        // nearly parallel to the plane: a miss when the segment stays well off the plane, else near
-        let h0 = dot(t.n, tv) / t.nl;
-        let h1 = h0 + tmax * dot(t.n, d) / t.nl;
-        return if h0.min(h1) > e || h0.max(h1) < -e { Hit::Miss } else { Hit::Near(tmin) };
-    }
-    let inv = 1.0 / det;
-    let u = dot(tv, pv) * inv;
-    let qv = cross(tv, t.e1);
-    let v = dot(d, qv) * inv;
-    let h = dot(t.e2, qv) * inv;
-    let m = u.min(v).min(1.0 - u - v);
-    if !(h.is_finite() && m.is_finite()) {
-        return Hit::Near(tmin);
-    }
-    let et = e / cos;
-    let ew = 2.0 * et * t.longest / t.nl;
-    if m < -ew || h < tmin - et || h > tmax + et {
+fn hit(o: [f64; 3], d: [f64; 3], t: &Tri, tmin: f64, tmax: f64) -> Hit {
+    let n = t.n;
+    // direction . normal: two roundings
+    let (a0, a1, a2) = (d[2] * n[2], d[1] * n[1], n[0] * d[0]);
+    let dn = a0 + (a1 + a2);
+    let edn = 8.0 * U * (a0.abs() + a1.abs() + a2.abs());
+    let adn = dn.abs();
+    if adn + edn < PARALLEL * (1.0 - 1e-9) {
         return Hit::Miss;
     }
-    if m > ew && h > tmin + et && h < tmax - et {
-        Hit::Sure(h)
+    if !(adn - edn > PARALLEL * (1.0 + 1e-9)) {
+        return Hit::Near(tmin);
+    }
+    // t = (D - origin . normal) / (direction . normal): three roundings, then the quotient
+    let (b0, b1, b2) = (o[2] * n[2], o[1] * n[1], o[0] * n[0]);
+    let num = t.d - (b0 + (b1 + b2));
+    let enm = 8.0 * U * (t.d.abs() + b0.abs() + b1.abs() + b2.abs());
+    let h = num / dn;
+    let et = 2.0 * (enm + h.abs() * edn) / (adn - edn) + 8.0 * U * h.abs();
+    let (lo, hi) = (h - et, h + et);
+    if !(lo.is_finite() && hi.is_finite()) {
+        return Hit::Near(tmin);
+    }
+    // below tmin, or its float beyond the light's distance (rounding to float is monotonic)
+    if hi < tmin || lo as f32 as f64 > tmax {
+        return Hit::Miss;
+    }
+    let near = Hit::Near(lo.max(tmin));
+    // the point is computed from float(t): only when the whole interval rounds to one float
+    let tf = lo as f32;
+    if tf != hi as f32 {
+        return near;
+    }
+    let tf = tf as f64;
+    let (pa, pb) = (o[t.ia] + tf * d[t.ia], o[t.ib] + tf * d[t.ib]);
+    let (wlo, whi) = if t.nk > 0.0 { (0.0, t.nk) } else { (t.nk, 0.0) };
+    let mut inside = true;
+    for k in 0..3 {
+        let (c, e) = (t.wc[k], t.we[k]);
+        let w = (pa - c[0]) * e[1] - (pb - c[1]) * e[0];
+        let ew = 16.0 * U * ((pa.abs() + c[0].abs()) * e[1].abs() + (pb.abs() + c[1].abs()) * e[0].abs());
+        if w + ew < wlo || w - ew > whi {
+            return Hit::Miss;
+        }
+        inside &= w - ew >= wlo && w + ew <= whi;
+    }
+    if inside && lo >= tmin && tf < tmax {
+        Hit::Sure(h, et)
     } else {
-        Hit::Near(h.max(tmin))
+        near
     }
 }
 
@@ -642,15 +947,51 @@ mod tests {
     use super::*;
 
     fn scene(tris: &[([[f32; 3]; 3], u16)]) -> Bvh {
+        let (tns, verts) = parts(tris);
+        Bvh::build(&tns, &verts, &(0..tns.len()).collect::<Vec<_>>()).unwrap()
+    }
+
+    fn parts(tris: &[([[f32; 3]; 3], u16)]) -> (Vec<Tn>, Vec<RVertex>) {
         let (mut tns, mut verts) = (Vec::new(), Vec::new());
         for (p, flags) in tris {
             let base = verts.len();
             for c in p {
                 verts.push(RVertex { world: Vector::new(c[0], c[1], c[2]), ..RVertex::default() });
             }
-            tns.push(Tn { v: [Some(base), Some(base + 1), Some(base + 2)], flags: *flags, ..Tn::default() });
+            tns.push(Tn { v: [Some(base), Some(base + 1), Some(base + 2)], flags: *flags, ..planes(p) });
         }
-        Bvh::build(&tns, &verts, &(0..tns.len()).collect::<Vec<_>>()).unwrap()
+        (tns, verts)
+    }
+
+    /// A triangle's stored plane, axis and edges, in floats (normal (v1 - v0) x (v2 - v0), distance normal . v0).
+    fn planes(p: &[[f32; 3]; 3]) -> Tn {
+        let v = p.map(|c| Vector::new(c[0], c[1], c[2]));
+        let sub = |a: Vector, b: Vector| Vector::new(a.x - b.x, a.y - b.y, a.z - b.z);
+        let (a, b) = (sub(v[1], v[0]), sub(v[2], v[0]));
+        let n = Vector::new(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x);
+        let d = n.x * v[0].x + n.y * v[0].y + n.z * v[0].z;
+        let axis = if n.x.abs() >= n.y.abs() && n.x.abs() >= n.z.abs() { 1 } else if n.y.abs() >= n.z.abs() { 2 } else { 3 };
+        Tn { n, d, axis, edge: [sub(v[2], v[1]), sub(v[0], v[2]), sub(v[1], v[0])], ..Tn::default() }
+    }
+
+    /// A state whose triangles are `tris`, each with material 0 (plain: no vertex colours, no blur) or, for flag
+    /// 0x1000 (ours, for the tests), material 1 with vertex colours; materials of opacity 0.3 and 0.8.
+    fn state(tris: &[([[f32; 3]; 3], u16)]) -> ShadeState {
+        let (mut tns, verts) = parts(tris);
+        for t in tns.iter_mut() {
+            if t.flags & 0x1000 != 0 {
+                t.material = 1;
+            }
+        }
+        let mut st = ShadeState { tns: tns.into(), verts: verts.into(), ..ShadeState::default() };
+        let mut m = crate::shade::ShadeMaterial { vcol_rgb: 1, vcol_alpha: 1, ..Default::default() };
+        m.work.opacity = 0.3;
+        m.work.diffuse = [0.9, 0.5, 0.2, 1.0];
+        st.materials.push(m.clone());
+        m.vcol_rgb = 0;
+        st.materials.push(m);
+        st.lights.push(crate::shade::ShadeLight { umbra: 0.25, ..Default::default() });
+        st
     }
 
     const UP: Vector = Vector { x: 0.0, y: 0.0, z: 1.0 };
@@ -662,19 +1003,22 @@ mod tests {
     #[test]
     fn clear_opaque_and_unsure() {
         let b = scene(&[tri_at(-3.0, 2.0, 0), tri_at(3.0, 2.0, 0x100)]);
+        // no materials: a transparent triangle is never plain
+        let st0 = ShadeState::default();
+        let mut ps = Passes::default();
         let tmin = SHADOW_TMIN;
         let at = |x: f32, y: f32| Vector::new(x, y, 0.0);
         // nothing above x = 10
-        assert_eq!(b.any_hit(at(10.0, 0.0), UP, usize::MAX, tmin, 5.0), Seen::Clear);
+        assert_eq!(b.any_hit(&st0, at(10.0, 0.0), UP, usize::MAX, tmin, 5.0, &mut ps), Seen::Clear);
         // the opaque triangle above x = -3, the transparent one above x = 3
-        assert_eq!(b.any_hit(at(-3.0, 0.0), UP, usize::MAX, tmin, 5.0), Seen::Opaque);
-        assert_eq!(b.any_hit(at(3.0, 0.0), UP, usize::MAX, tmin, 5.0), Seen::Unsure);
+        assert_eq!(b.any_hit(&st0, at(-3.0, 0.0), UP, usize::MAX, tmin, 5.0, &mut ps), Seen::Opaque);
+        assert_eq!(b.any_hit(&st0, at(3.0, 0.0), UP, usize::MAX, tmin, 5.0, &mut ps), Seen::Unsure);
         // the light below the triangle: clear; the triangle shaded is not looked at
-        assert_eq!(b.any_hit(at(-3.0, 0.0), UP, usize::MAX, tmin, 1.5), Seen::Clear);
-        assert_eq!(b.any_hit(at(-3.0, 0.0), UP, 0, tmin, 5.0), Seen::Clear);
+        assert_eq!(b.any_hit(&st0, at(-3.0, 0.0), UP, usize::MAX, tmin, 1.5, &mut ps), Seen::Clear);
+        assert_eq!(b.any_hit(&st0, at(-3.0, 0.0), UP, 0, tmin, 5.0, &mut ps), Seen::Clear);
         // through a corner, or ending at the triangle: the original's walk decides
-        assert_eq!(b.any_hit(at(-4.0, -1.0), UP, usize::MAX, tmin, 5.0), Seen::Unsure);
-        assert_eq!(b.any_hit(at(-3.0, 0.0), UP, usize::MAX, tmin, 2.0), Seen::Unsure);
+        assert_eq!(b.any_hit(&st0, at(-4.0, -1.0), UP, usize::MAX, tmin, 5.0, &mut ps), Seen::Unsure);
+        assert_eq!(b.any_hit(&st0, at(-3.0, 0.0), UP, usize::MAX, tmin, 2.0, &mut ps), Seen::Unsure);
     }
 
     #[test]
@@ -685,20 +1029,71 @@ mod tests {
             Vector::new(dx / l, 0.0, dz / l)
         };
         let o = Vector::new(-5.0, 0.0, 0.0);
+        let st0 = ShadeState::default();
+        let mut ps = Passes::default();
         // the ray from x = -5 meets z = 1 at x = -1 and z = 2 at x = 3
         let b = scene(&[tri_at(3.0, 2.0, 0)]);
-        assert_eq!(b.any_hit(o, d, usize::MAX, SHADOW_TMIN, 20.0), Seen::Opaque);
-        // a transparent triangle in front of the opaque one: unsure; behind it: opaque
+        assert_eq!(b.any_hit(&st0, o, d, usize::MAX, SHADOW_TMIN, 20.0, &mut ps), Seen::Opaque);
+        // a transparent triangle (not plain here) in front of the opaque one: unsure; behind it: opaque
         let b = scene(&[tri_at(3.0, 2.0, 0), tri_at(-1.0, 1.0, 0x200)]);
-        assert_eq!(b.any_hit(o, d, usize::MAX, SHADOW_TMIN, 20.0), Seen::Unsure);
+        assert_eq!(b.any_hit(&st0, o, d, usize::MAX, SHADOW_TMIN, 20.0, &mut ps), Seen::Unsure);
         let b = scene(&[tri_at(3.0, 2.0, 0), tri_at(7.0, 3.0, 0x200)]);
-        assert_eq!(b.any_hit(o, d, usize::MAX, SHADOW_TMIN, 20.0), Seen::Opaque);
+        assert_eq!(b.any_hit(&st0, o, d, usize::MAX, SHADOW_TMIN, 20.0, &mut ps), Seen::Opaque);
+    }
+
+    #[test]
+    fn through_transparent_triangles() {
+        let at = |x: f32| Vector::new(x, 0.0, 0.0);
+        let mut ps = Passes::default();
+        let run = |tris: &[([[f32; 3]; 3], u16)], o: Vector, tmax: f32, ps: &mut Passes| {
+            let st = state(tris);
+            let b = Bvh::build(&st.tns, &st.verts, &(0..st.tns.len()).collect::<Vec<_>>()).unwrap();
+            b.any_hit(&st, o, UP, usize::MAX, SHADOW_TMIN, tmax, ps)
+        };
+        // two plain transparent triangles: through both, nearest first
+        let two = [tri_at(0.0, 3.0, 0x100), tri_at(0.0, 1.0, 0x200)];
+        assert_eq!(run(&two, at(0.0), 5.0, &mut ps), Seen::Through);
+        assert_eq!(&ps.tn[..ps.n], &[1, 0]);
+        // the light between them: through the lower one only
+        assert_eq!(run(&two, at(0.0), 2.0, &mut ps), Seen::Through);
+        assert_eq!(&ps.tn[..ps.n], &[1]);
+        // an opaque triangle behind them: opaque; in front of them: opaque
+        assert_eq!(run(&[two[0], two[1], tri_at(0.0, 4.0, 0)], at(0.0), 5.0, &mut ps), Seen::Opaque);
+        assert_eq!(run(&[two[0], two[1], tri_at(0.0, 0.5, 0)], at(0.0), 5.0, &mut ps), Seen::Opaque);
+        // an opaque one closer behind a transparent one than the walk's step past it: the walk skips it
+        assert_eq!(run(&[tri_at(0.0, 1.0, 0x100), tri_at(0.0, 1.00005, 0)], at(0.0), 5.0, &mut ps), Seen::Unsure);
+        // two transparent ones as close: unsure
+        assert_eq!(run(&[tri_at(0.0, 1.0, 0x100), tri_at(0.0, 1.00005, 0x100)], at(0.0), 5.0, &mut ps), Seen::Unsure);
+        // vertex colours (material 1): unsure
+        assert_eq!(run(&[tri_at(0.0, 1.0, 0x1100)], at(0.0), 5.0, &mut ps), Seen::Unsure);
+        // the texture stage (0x400): unsure
+        assert_eq!(run(&[tri_at(0.0, 1.0, 0x500)], at(0.0), 5.0, &mut ps), Seen::Unsure);
+        // the factor: as the walk computes it (k = 0.7 > 0.5: w = 0.4, (0.6 d + 0.4) twice, then the umbra blend)
+        let st = state(&two);
+        let p = Passes { n: 2, tn: [1, 0, 0, 0, 0, 0, 0, 0] };
+        let f = through(&st, 0, &p);
+        for (i, d) in [0.9f64, 0.5, 0.2].iter().enumerate() {
+            let one = 0.6 * d + 0.4;
+            let want = 0.75 * one * one + 0.25;
+            assert!((f[i] as f64 - want).abs() < 1e-6, "{i} {} {want}", f[i]);
+        }
+    }
+
+    #[test]
+    fn the_triangle_shaded_is_met_again_only_after_the_first() {
+        // the point shaded lies on a slanted transparent triangle (index 0); the ray passes a plain one above it
+        let tris = [([[-1.0, -1.0, -1.0], [1.0, -1.0, 1.0], [0.0, 1.0, 0.0]], 0x100u16), tri_at(0.0, 2.0, 0x100)];
+        let st = state(&tris);
+        let b = Bvh::build(&st.tns, &st.verts, &[0, 1]).unwrap();
+        let mut ps = Passes::default();
+        assert_eq!(b.any_hit(&st, Vector::new(0.0, 0.0, 0.0), UP, 0, SHADOW_TMIN, 5.0, &mut ps), Seen::Through);
+        assert_eq!(&ps.tn[..ps.n], &[1]);
     }
 
     #[test]
     fn many_triangles_agree_with_a_plain_test() {
-        // a grid of small triangles over [-4, 4]^2 at heights 1..3, every third transparent; rays up from below,
-        // slanted: the hierarchy's answer against testing every triangle
+        // a grid of small triangles over [-4, 4]^2 at heights 1..3, every third transparent (plain); rays up from
+        // below, slanted: the hierarchy's answer against testing every triangle
         let mut tris = Vec::new();
         for i in 0..40 {
             for j in 0..40 {
@@ -709,35 +1104,35 @@ mod tests {
                 }
             }
         }
-        let b = scene(&tris);
+        let st = state(&tris);
+        let b = Bvh::build(&st.tns, &st.verts, &(0..st.tns.len()).collect::<Vec<_>>()).unwrap();
         let mut seed = 12345u32;
         let mut rnd = || {
             seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
             (seed >> 8) as f32 / 16_777_216.0
         };
-        let (mut seen, mut sure) = ([0usize; 3], 0);
+        let (mut seen, mut sure) = ([0usize; 4], 0);
+        let (mut ps, mut pw) = (Passes::default(), Passes::default());
         for _ in 0..4000 {
             let o = Vector::new(-4.0 + 8.0 * rnd(), -4.0 + 8.0 * rnd(), 0.0);
             let (dx, dy) = (rnd() - 0.5, rnd() - 0.5);
             let l = (dx * dx + dy * dy + 1.0).sqrt();
             let d = Vector::new(dx / l, dy / l, 1.0 / l);
-            let got = b.any_hit(o, d, usize::MAX, SHADOW_TMIN, 5.0);
-            // the plain answer: the nearest triangle hit (by the same test) decides
+            let got = b.any_hit(&st, o, d, usize::MAX, SHADOW_TMIN, 5.0, &mut ps);
+            // the plain answer: every triangle tested
             let (o64, d64) = ([o.x as f64, o.y as f64, o.z as f64], [d.x as f64, d.y as f64, d.z as f64]);
-            let e = b.margin(o64);
-            let (mut t_op, mut t_un) = (f64::INFINITY, f64::INFINITY);
-            for t in &b.tris {
-                match hit(o64, d64, t, SHADOW_TMIN as f64, 5.0, e) {
-                    Hit::Miss => {}
-                    Hit::Sure(h) if t.opaque => t_op = t_op.min(h),
-                    Hit::Sure(h) | Hit::Near(h) => t_un = t_un.min(h),
-                }
+            let mut g = Gather::new();
+            for (i, t) in b.tris.iter().enumerate() {
+                g.add(hit(o64, d64, t, SHADOW_TMIN as f64, 5.0), t, i as u32);
             }
-            assert_eq!(got, answer(t_op, t_un));
+            let want = b.decide(&st, &mut g, o64, d64, usize::MAX, 5.0, &mut pw);
+            assert_eq!(got, want);
+            assert_eq!(&ps.tn[..ps.n], &pw.tn[..pw.n]);
             seen[got as usize] += 1;
             sure += (got != Seen::Unsure) as usize;
         }
-        assert!(seen.iter().all(|&c| c > 100), "{seen:?}");
+        // clear, opaque, through (unsure: rays near an edge, few)
+        assert!(seen[0] > 100 && seen[1] > 100 && seen[3] > 100, "{seen:?}");
         assert!(sure > 2000);
     }
 
@@ -755,8 +1150,9 @@ mod tests {
                 }
             }
         }
-        let b = scene(&tris);
-        let mut st = ShadeState::default();
+        let mut st = state(&tris);
+        st.lights.clear();
+        let b = Bvh::build(&st.tns, &st.verts, &(0..st.tns.len()).collect::<Vec<_>>()).unwrap();
         for k in 0..24 {
             let (u, v) = ((k as f32 + 0.5) / 24.0 - 0.5, ((k * 7) % 24) as f32 / 24.0 - 0.5);
             st.lights.push(crate::shade::ShadeLight { kind: 2, pos: Vector::new(1.0 + 2.0 * u, v, 6.0), array: 1, ..Default::default() });
@@ -772,7 +1168,8 @@ mod tests {
             (seed >> 8) as f32 / 16_777_216.0
         };
         let mut sh = Shaft::default();
-        let (mut seen, mut answered) = ([0usize; 3], 0);
+        let (mut seen, mut answered) = ([0usize; 4], 0);
+        let (mut ps, mut pw) = (Passes::default(), Passes::default());
         for _ in 0..600 {
             let p = Vector::new(-5.0 + 10.0 * rnd(), -5.0 + 10.0 * rnd(), 0.5 * rnd());
             for li in 0..st.lights.len() {
@@ -784,16 +1181,93 @@ mod tests {
                     let l = (w[0] * w[0] + w[1] * w[1] + w[2] * w[2]).sqrt();
                     (Vector::new(w[0] / l, w[1] / l, w[2] / l), l)
                 };
-                let got = b.shaft_hit(&mut sh, &st, li, p, d, usize::MAX, SHADOW_TMIN, dist);
-                let want = b.any_hit(p, d, usize::MAX, SHADOW_TMIN, dist);
+                let got = b.shaft_hit(&mut sh, &st, li, p, d, usize::MAX, SHADOW_TMIN, dist, &mut ps);
+                let want = b.any_hit(&st, p, d, usize::MAX, SHADOW_TMIN, dist, &mut pw);
                 // the shaft may be sure where the hierarchy's margins left it unsure, never the other way round
                 assert!(got == want || want == Seen::Unsure, "{got:?} {want:?}");
+                if got == want {
+                    assert_eq!(&ps.tn[..ps.n], &pw.tn[..pw.n]);
+                }
                 seen[got as usize] += 1;
                 answered += (!sh.many) as usize;
             }
         }
-        assert!(seen.iter().all(|&c| c > 100), "{seen:?}");
+        // clear, opaque, through (unsure: rays near an edge, few)
+        assert!(seen[0] > 100 && seen[1] > 100 && seen[3] > 100, "{seen:?}");
         assert!(answered > 3000, "{answered}");
+    }
+
+    /// [`hit`] against the walk's own test (render.rs `probe`, the original's arithmetic in extended precision) on
+    /// random triangles at three scales and rays aimed at their corners, edges, just inside and outside, from points on
+    /// their plane, nearly along it, with tmin and the light's distance at the hit: Sure only on the walk's hits (its
+    /// distance within the bound), Miss only where it misses, Near never beyond a hit.
+    #[test]
+    fn the_test_answers_as_the_walks() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut u = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let mut count = [0usize; 3];
+        for case in 0..200_000 {
+            let scale = [1.0f32, 0.01, 20.0][case % 3];
+            let mut pt = |u: &mut dyn FnMut() -> f64| [0, 1, 2].map(|_| (u() * 2.0 - 1.0) as f32 * scale);
+            let p = [pt(&mut u), pt(&mut u), pt(&mut u)];
+            let (tns, verts) = parts(&[(p, 0)]);
+            let Some(b) = Bvh::build(&tns, &verts, &[0]) else { continue };
+            let bary = |u: &mut dyn FnMut() -> f64| match (u() * 6.0) as usize {
+                0 => 0.0f32,
+                1 => 1.0,
+                2 => (u() * 1e-6 - 5e-7) as f32,
+                3 => (1.0 + u() * 1e-6 - 5e-7) as f32,
+                _ => (u() * 1.4 - 0.2) as f32,
+            };
+            let (ba, bb) = (bary(&mut u), bary(&mut u));
+            let bc = 1.0 - ba - bb;
+            let target = [0, 1, 2].map(|k| p[0][k] * ba + p[1][k] * bb + p[2][k] * bc);
+            let on_plane = u() < 0.15;
+            let origin = if on_plane { target } else { [0, 1, 2].map(|k| (u() * 2.0 - 1.0) as f32 * 3.0 * scale) };
+            let mut dir = if on_plane { [0, 1, 2].map(|_| (u() * 2.0 - 1.0) as f32) } else { [0, 1, 2].map(|k| target[k] - origin[k]) };
+            if u() < 0.1 {
+                // nearly along the plane: an edge and a little of the normal
+                let (e, n) = (tns[0].edge[(u() * 3.0) as usize % 3], tns[0].n);
+                let k = (u() * 2.0 - 1.0) as f32 * 1e-7;
+                dir = [e.x + k * n.x, e.y + k * n.y, e.z + k * n.z];
+            }
+            let l = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
+            if !(l > 0.0) {
+                continue;
+            }
+            let dir = dir.map(|c| c / l);
+            let dist = ((0..3).map(|k| ((target[k] - origin[k]) as f64).powi(2)).sum::<f64>()).sqrt();
+            let jitter = |u: &mut dyn FnMut() -> f64| (dist * (1.0 + (u() - 0.5) * 1e-6)) as f32;
+            let tmin = if u() < 0.2 { jitter(&mut u) } else { SHADOW_TMIN };
+            let tmax = if u() < 0.2 { jitter(&mut u) } else { (dist * (1.0 + 3.0 * u())) as f32 + scale };
+            let ray = crate::types::Ray { origin: Vector::new(origin[0], origin[1], origin[2]), dir: Vector::new(dir[0], dir[1], dir[2]), t: 1e30, ..Default::default() };
+            let walk = crate::render::probe(&ray, &tns, &verts, 0, tmin).filter(|h| h.tf < tmax);
+            let (o64, d64) = (origin.map(|c| c as f64), dir.map(|c| c as f64));
+            match hit(o64, d64, &b.tris[0], tmin as f64, tmax as f64) {
+                Hit::Sure(h, et) => {
+                    let w = walk.unwrap_or_else(|| panic!("sure on the walk's miss: {p:?} {ray:?} {tmin:e} {tmax:e}"));
+                    assert!((w.t.to_f64() - h).abs() <= et, "{p:?} {ray:?}: {} against {h} within {et:e}", w.t.to_f64());
+                    count[0] += 1;
+                }
+                Hit::Miss => {
+                    assert!(walk.is_none(), "miss on the walk's hit: {p:?} {ray:?} {tmin:e} {tmax:e}");
+                    count[1] += 1;
+                }
+                Hit::Near(lo) => {
+                    if let Some(w) = walk {
+                        assert!(w.t.to_f64() >= lo, "{p:?} {ray:?}");
+                    }
+                    count[2] += 1;
+                }
+            }
+        }
+        eprintln!("sure {}, miss {}, near {}", count[0], count[1], count[2]);
+        assert!(count[0] > 10_000 && count[1] > 100_000 && count[2] < count[0] / 4, "{count:?}");
     }
 
     #[test]

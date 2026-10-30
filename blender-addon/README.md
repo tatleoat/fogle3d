@@ -71,7 +71,7 @@ should be disabled. Preferences > Add-ons > Fogle3D:
 | Hardware x87 build, render-frames (hardware x87) | use the separately set binary instead (the default build is already hardware on x86-64) | off |
 | blend2db | path of `blend2db` (scene field default: env `SI3D_BLEND2DB`) | empty |
 | Processes (animation) | renderer processes for an animation render; 0 = all cores but one, at most 16 | 0 |
-| Band threads | threads inside one frame (`RENDER_THREADS`); 0 = all cores but one, at most 16 for a still image, 1 for an animation | 0 |
+| Band threads | threads inside one frame (`RENDER_THREADS`); 0 = all cores but one for a still image (fewer when memory is short), 1 for an animation | 0 |
 | Memory per process | address-space cap per renderer process (`ulimit -v`), MB; 0 = automatic: 2000 plus about 600 per million pixels of the picture and 128 per band thread, at most three quarters of the machine's memory (a 4K still with 16 band threads gets about 9-12 GB) | 0 |
 
 Env overrides when the preference is 0: `SI3D_PROCESSES`, `SI3D_BAND_THREADS`, `SI3D_MEM_MB`. Render Properties >

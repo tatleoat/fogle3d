@@ -1,0 +1,23 @@
+# blend2db (unit builder1): Blender scene (JSON from export.scene_to_dict) -> Softimage database the
+# renderer's loader accepts, and the round-trip test of the writers. Our own code; outside the workspace
+# (own lock file, like re/tools/si-render/pictures). Build from the repository root:
+#   CARGO_TARGET_DIR=$PWD/target/slot-3 re/tools/lead/slot.sh build -- cargo build --release --manifest-path re/tools/builder2/blend2db/Cargo.toml
+[package]
+name = "blend2db"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+si-ascii = { path = "../../../../crates/si-ascii" }
+si-elemio = { path = "../../../../crates/si-elemio" }
+si-hrc = { path = "../../../../crates/si-hrc" }
+si-file = { path = "../../../../crates/si-file" }
+si-picture = { path = "../../../../crates/si-picture" }
+si-install = { path = "../../pkg/si-install" }
+serde_json = "1"
+
+[profile.release]
+debug = false

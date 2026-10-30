@@ -1,0 +1,18 @@
+[package]
+name = "si-ascii"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Softimage|3D ASCII files: token reader, scene description, setup, and the text form of binary element files (bin2ascii)"
+
+[dependencies]
+si-rt = { path = "../si-rt" }
+si-file = { path = "../si-file" }
+# The binary readers and writers of element files, as values: the text form of
+# `bin2ascii` (module `b2a`) is written from what they read and read back into them.
+si-hrc = { path = "../si-hrc" }
+si-elemio = { path = "../si-elemio" }
+# The memory image the raw function-curve routines (`rawfcv`) work on, and the vector reader
+# of the emulation check (`ascii-emucheck`).
+si-mem = { path = "../si-mem" }
+si-x87 = { path = "../si-x87" }

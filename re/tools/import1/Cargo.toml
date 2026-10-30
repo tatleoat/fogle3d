@@ -1,0 +1,37 @@
+# si-import-dump (units import1/import2): a Softimage scene (.dsc and its database) loaded with the engine, written out
+# as JSON for the Blender importer (blender-addon/softimage3d/importer.py; docs/design/softimage-import.md).
+# Own workspace, like re/tools/si-render/pictures and re/tools/builder2/blend2db. Build from the repository root:
+#   cargo build --release --manifest-path re/tools/import1/Cargo.toml
+[package]
+name = "si-import-dump"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+si-render = { path = "../../../crates/si-render" }
+si-rensetup = { path = "../../../crates/si-rensetup" }
+si-scene = { path = "../../../crates/si-scene" }
+si-db = { path = "../../../crates/si-db" }
+si-mem = { path = "../../../crates/si-mem" }
+si-types = { path = "../../../crates/si-types" }
+si-math = { path = "../../../crates/si-math" }
+si-model = { path = "../../../crates/si-model" }
+si-hrc = { path = "../../../crates/si-hrc" }
+si-x87 = { path = "../../../crates/si-x87" }
+# the install-path layer (release model): the scene's install is the user's own
+si-install = { path = "../pkg/si-install" }
+# the original's tables and messages from the user's program file, checked at start
+si-rt = { path = "../../../crates/si-rt" }
+serde_json = "1"
+
+[[bin]]
+name = "si-import-dump"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+debug = false
+panic = "unwind"

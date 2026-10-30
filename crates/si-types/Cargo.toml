@@ -1,0 +1,9 @@
+[package]
+name = "si-types"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Softimage|3D core in-memory structures: element dictionaries, relations, attributes, models and their geometry, laid out offset for offset as in the 32-bit original"
+
+[dependencies]
+si-mem = { path = "../si-mem" }

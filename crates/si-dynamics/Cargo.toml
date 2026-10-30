@@ -1,0 +1,28 @@
+[package]
+name = "si-dynamics"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Softimage|3D dynamics on the shared memory image: collisions.c, the collision detection and resolution of the rigid-body dynamics (finding 0035)"
+
+[dependencies]
+# the shared memory image (finding 0024)
+si-mem = { path = "../si-mem" }
+# the x87 unit the original was compiled for
+si-x87 = { path = "../si-x87" }
+# the matrix routines the check runs for the callees of other files
+si-math = { path = "../si-math" }
+# SI_modelComputeBounding (model.c)
+si-model = { path = "../si-model" }
+# SI_modelNbSubModels
+si-scene = { path = "../si-scene" }
+si-types = { path = "../si-types" }
+# the allocators of the dynamics records (si-hrc), the kinematic state record (si-kine)
+si-hrc = { path = "../si-hrc" }
+si-kine = { path = "../si-kine" }
+# the generic check driver (finding 0011)
+si-checkkit = { path = "../si-checkkit" }
+
+[[bin]]
+name = "dynamics-checkkit"
+path = "src/bin/dynamics-checkkit/main.rs"

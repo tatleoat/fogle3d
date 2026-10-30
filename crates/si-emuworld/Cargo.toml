@@ -1,0 +1,28 @@
+[package]
+name = "si-emuworld"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "A loaded sample scene as the starting memory of an emulation check: loads one scene with the ports that are on the shared memory image (si-scene, si-hrc's image readers, si-view's list builder), writes the image out for the emulation harness (re/tools/emu/sceneworld.py), and compares ports with the vectors the harness then writes (finding 0011)"
+
+[dependencies]
+si-mem = { path = "../si-mem" }
+si-types = { path = "../si-types" }
+si-db = { path = "../si-db" }
+si-dict = { path = "../si-dict" }
+si-scene = { path = "../si-scene" }
+si-view = { path = "../si-view" }
+si-hrc = { path = "../si-hrc" }
+si-model = { path = "../si-model" }
+
+[[bin]]
+name = "scene-dump"
+path = "src/bin/scene-dump.rs"
+
+[[bin]]
+name = "world-emucheck"
+path = "src/bin/world-emucheck.rs"
+
+[[bin]]
+name = "example-emucheck"
+path = "src/bin/example-emucheck.rs"

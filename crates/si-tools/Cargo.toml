@@ -1,0 +1,17 @@
+[package]
+name = "si-tools"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Softimage|3D 4.0 model converters on the shared memory image: owave2soft.c (Wavefront .obj reader and model builder), osoft2wave.c, osoft2vert.c (finding 0039)"
+
+[dependencies]
+si-x87 = { path = "../si-x87" }
+# the shared memory image (finding 0024)
+si-mem = { path = "../si-mem" }
+# the generic check driver (toolbelt T2, finding 0011), for `tools-checkkit`
+si-checkkit = { path = "../si-checkkit" }
+
+[[bin]]
+name = "tools-checkkit"
+path = "src/bin/tools-checkkit/main.rs"

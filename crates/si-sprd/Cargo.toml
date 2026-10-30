@@ -1,0 +1,17 @@
+[package]
+name = "si-sprd"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Softimage|3D's spreadsheet and query modules on the shared memory image: sprd_fct.c (the setup records of a spreadsheet: query groups, sort and field lists, element lists), sprd_io.c (their file form) and spreadsheet.c (the grid widget)"
+
+[dependencies]
+# the shared memory image (finding 0024)
+si-mem = { path = "../si-mem" }
+# the vector format and the generic check driver (finding 0011)
+si-x87 = { path = "../si-x87" }
+si-checkkit = { path = "../si-checkkit" }
+
+[[bin]]
+name = "sprd-checkkit"
+path = "src/bin/sprd-checkkit/main.rs"

@@ -1,0 +1,22 @@
+[package]
+name = "si-mental"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Softimage|3D's mental ray translator on the shared memory image: the .mi scene writer (package 63; finding 0036)"
+
+[dependencies]
+# the shared memory image (finding 0024)
+si-mem = { path = "../si-mem" }
+# the x87 model: the translator prints values computed in 80-bit registers
+si-x87 = { path = "../si-x87" }
+# `mental-checkkit` answers the ported callees from their crates (finding 0036)
+si-nurbs = { path = "../si-nurbs" }
+# the generic check driver (finding 0011), for `mental-checkkit`
+si-checkkit = { path = "../si-checkkit" }
+# the original's tables and messages, read at run time from the user's install (docs/design/runtime-data.md)
+si-rt = { path = "../si-rt" }
+
+[[bin]]
+name = "mental-checkkit"
+path = "src/bin/mental-checkkit/main.rs"

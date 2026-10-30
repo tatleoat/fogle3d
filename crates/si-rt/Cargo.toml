@@ -1,0 +1,12 @@
+[package]
+name = "si-rt"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Run-time data: the original program's own tables and messages, read from the user's own Softimage|3D 4.0 install when a program runs (release model: nothing of the original ships); finds the program file, checks it is the expected build, and serves its bytes by address; depends on no other crate"
+
+[dependencies]
+
+[[bin]]
+name = "si-rt"
+path = "src/bin/si-rt.rs"

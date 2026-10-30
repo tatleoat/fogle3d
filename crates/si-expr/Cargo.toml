@@ -1,0 +1,25 @@
+[package]
+name = "si-expr"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Softimage|3D expressions: scanner, parser, parse tree, printer, evaluator and built-in functions, reading and writing"
+
+[dependencies]
+si-x87 = { path = "../si-x87" }
+si-file = { path = "../si-file" }
+si-ascii = { path = "../si-ascii" }
+si-fcurve = { path = "../si-fcurve" }
+# the image form (src/image): the shared image, the dictionaries on it, the update's curve
+# look-ups and curve evaluation, the rotation extraction
+si-mem = { path = "../si-mem" }
+si-types = { path = "../si-types" }
+si-dict = { path = "../si-dict" }
+si-motion = { path = "../si-motion" }
+si-math = { path = "../si-math" }
+# the original parser's tables, read at run time from the user's install
+si-rt = { path = "../si-rt" }
+# the graf lists (SI_findGlData) of SI_modelSetHiddenParam
+si-view = { path = "../si-view" }
+# the generic check driver (finding 0011, "A check binary with si-checkkit"), for `lexrt-checkkit`
+si-checkkit = { path = "../si-checkkit" }

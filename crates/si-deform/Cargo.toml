@@ -1,0 +1,26 @@
+[package]
+name = "si-deform"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Softimage|3D lattices, clusters of points and the fitting records on the shared memory image (si-mem): records in place at the original's layout, each function taking the image and the original's arguments and making the original's allocation calls"
+
+[dependencies]
+si-mem = { path = "../si-mem" }
+si-types = { path = "../si-types" }
+si-x87 = { path = "../si-x87" }
+si-math = { path = "../si-math" }
+# the ports `routed` hands the calls out of this crate to (finding 0029 section 20)
+si-dict = { path = "../si-dict" }
+si-model = { path = "../si-model" }
+si-spline = { path = "../si-spline" }
+si-nurbs = { path = "../si-nurbs" }
+si-hrc = { path = "../si-hrc" }
+si-kine = { path = "../si-kine" }
+si-view = { path = "../si-view" }
+si-anim = { path = "../si-anim" }
+si-motion = { path = "../si-motion" }
+
+[[bin]]
+name = "deform-emucheck"
+path = "src/bin/deform-emucheck/main.rs"

@@ -1,0 +1,10 @@
+[package]
+name = "si-file"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Softimage|3D database files: the C-stdio-like stream the readers assume, big-endian fields, the file header and the table of file types"
+
+[dependencies]
+# the file types' descriptions, read at run time from the user's install (unit rta)
+si-rt = { path = "../si-rt" }

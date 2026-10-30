@@ -1,0 +1,16 @@
+[package]
+name = "si-spline"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Softimage|3D splines: the four curve types, evaluation, length tables, editing primitives, conversions and curve fitting, computed on the software x87 unit"
+
+[dependencies]
+si-x87 = { path = "../si-x87" }
+si-math = { path = "../si-math" }
+si-types = { path = "../si-types" }
+si-mem = { path = "../si-mem" }
+si-hrc = { path = "../si-hrc" }
+si-nurbs = { path = "../si-nurbs" }
+si-checkkit = { path = "../si-checkkit" }
+si-ui = { path = "../si-ui" }

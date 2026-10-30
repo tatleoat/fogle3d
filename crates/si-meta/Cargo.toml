@@ -1,0 +1,25 @@
+[package]
+name = "si-meta"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Softimage|3D metaballs on the shared memory image: metaball.c, the metaball and metasystem records, their groups and unblend pairs, the surface and the drawing (finding 0038)"
+
+[dependencies]
+# the shared memory image (finding 0024)
+si-mem = { path = "../si-mem" }
+si-types = { path = "../si-types" }
+si-x87 = { path = "../si-x87" }
+# the allocators of metaball.c (SI_metaballAllocate, SI_metaSystemAllocate), the model walk
+# (SI_modelNextSon) and the ball's bounding box, already on the image
+si-hrc = { path = "../si-hrc" }
+si-model = { path = "../si-model" }
+si-math = { path = "../si-math" }
+# the attribute dictionary (SI_ATD), whose metaball access words SI_metaLicenseCheckForAttribute changes
+si-dict = { path = "../si-dict" }
+# the generic check driver (toolbelt T2, finding 0011), for `meta-checkkit`
+si-checkkit = { path = "../si-checkkit" }
+
+[[bin]]
+name = "meta-checkkit"
+path = "src/bin/meta-checkkit/main.rs"

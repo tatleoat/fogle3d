@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+# one crate per recovered subsystem; a new crate needs no edit here
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+
+# Shipping profile for the render binaries built from this workspace (speed program step 1,
+# unit perf1): fat LTO + one code-generation unit, no target-cpu; `cargo build --profile dist`.
+# `release` stays as it is so that everybody's day-to-day builds do not pay for fat LTO
+# (re/tools/si-render/pictures, its own workspace, has the same settings in its release profile).
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1

@@ -1,0 +1,23 @@
+[package]
+name = "si-anim"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Softimage|3D shape animation, cluster animation and action lists on the shared memory image (si-mem): records in place at the original's layout, each function taking the image and the original's arguments and making the original's allocation calls"
+
+[dependencies]
+si-mem = { path = "../si-mem" }
+si-types = { path = "../si-types" }
+si-x87 = { path = "../si-x87" }
+si-math = { path = "../si-math" }
+si-checkkit = { path = "../si-checkkit" }
+# the original's tables and messages, read at run time from the user's install (docs/design/runtime-data.md)
+si-rt = { path = "../si-rt" }
+
+[[bin]]
+name = "anim-emucheck"
+path = "src/bin/anim-emucheck/main.rs"
+
+[[bin]]
+name = "anim-checkkit"
+path = "src/bin/anim-checkkit/main.rs"

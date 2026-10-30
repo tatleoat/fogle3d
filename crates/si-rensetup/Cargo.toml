@@ -1,0 +1,75 @@
+[package]
+name = "si-rensetup"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Softimage|3D render set-up: everything between the render command and the renderer's entry (the render dictionary, propagation of flags, transformations and materials, instance expansion, the render camera and picture names, the sub-region box, preview, operating-system services)"
+
+[dependencies]
+si-types = { path = "../si-types" }
+si-mem = { path = "../si-mem" }
+# the original's message texts and data tables, read from the user's own install at run time
+si-rt = { path = "../si-rt" }
+si-dict = { path = "../si-dict" }
+si-scene = { path = "../si-scene" }
+si-db = { path = "../si-db" }
+si-hrc = { path = "../si-hrc" }
+si-math = { path = "../si-math" }
+si-x87 = { path = "../si-x87" }
+# the fourth pass (finding 0023, section 18): the graph list and its builder, the node update
+# and the renderer's entry, each on the shared image
+si-view = { path = "../si-view" }
+si-model = { path = "../si-model" }
+si-render = { path = "../si-render" }
+si-ascii = { path = "../si-ascii" }
+si-elemio = { path = "../si-elemio" }
+# the sixth pass (finding 0023, section 21): the scene brought to the frame's time by
+# si-motion's SI_sceneUpdateItems, with the path code's spline routines of si-spline
+si-motion = { path = "../si-motion" }
+si-spline = { path = "../si-spline" }
+# the seventh pass (finding 0023, section 22): the update's inverse kinematics and
+# constraints on the image (finding 0022)
+si-kine = { path = "../si-kine" }
+# the update's expressions on the image (finding 0013, section 12)
+si-expr = { path = "../si-expr" }
+# the update's clusters on the image: SI_klusterGetTrueIndex, SI_klusterCountVertexRef
+# (finding 0028; finding 0023, section 23)
+si-deform = { path = "../si-deform" }
+# the update's camera matrix (SI_camMat, finding 0032)
+si-camera = { path = "../si-camera" }
+# the update's shape interpolators (shape.c on the image, finding 0030)
+si-anim = { path = "../si-anim" }
+# the path code's point on a NURBS curve (SI_nurbsCrvValue on the image)
+si-nurbs = { path = "../si-nurbs" }
+# routing3: the three mi_mr_main.c routines the render command calls (mental depends on no rensetup)
+si-mental = { path = "../si-mental" }
+# routing4: the metaball routines the model copy and the expressions call (depends on no rensetup)
+si-meta = { path = "../si-meta" }
+
+# routeF: SI_genTreeDestroy (depends on no rensetup)
+si-gen = { path = "../si-gen" }
+
+# routing6: SI_dynaAlgoTypeSet (depends on no rensetup)
+si-dynamics = { path = "../si-dynamics" }
+
+# routing7: SI_animBooleanUpdate and the boolean engine (depends on no rensetup)
+si-boolean = { path = "../si-boolean" }
+
+# render2: the picture writer screenToRle uses (depends on no rensetup)
+si-picture = { path = "../si-picture" }
+
+# wire2: createModelFromRevolution's full port (depends on no rensetup)
+si-modeler = { path = "../si-modeler" }
+
+# lic2: SI_matterInit (si-matter) and SI_cusInit (si-custom), answered by the World (neither depends on rensetup)
+si-matter = { path = "../si-matter" }
+# wire5: SI_cusDeleteIcon and SI_cusElemCallbackUpdateEffectsForDeletion for SI_graflistDeleteGrafnode (si-custom depends on no rensetup, no si-view)
+si-custom = { path = "../si-custom" }
+
+[[bin]]
+name = "rensetup-check"
+path = "src/bin/rensetup-check.rs"
+
+[[bin]]
+name = "rensetup-emucheck"
+path = "src/bin/rensetup-emucheck.rs"

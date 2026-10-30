@@ -1,0 +1,26 @@
+[package]
+name = "si-modeler"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Softimage|3D modelling tools' geometry on the shared memory image: the extrusion tool (extrusion.c) and the other tools of package 20"
+
+[dependencies]
+si-types = { path = "../si-types" }
+si-mem = { path = "../si-mem" }
+si-math = { path = "../si-math" }
+si-x87 = { path = "../si-x87" }
+si-hrc = { path = "../si-hrc" }
+si-model = { path = "../si-model" }
+si-nurbs = { path = "../si-nurbs" }
+si-spline = { path = "../si-spline" }
+si-deform = { path = "../si-deform" }
+si-dict = { path = "../si-dict" }
+si-gen = { path = "../si-gen" }
+si-view = { path = "../si-view" }
+# the generic check driver (finding 0011, "A check binary with si-checkkit")
+si-checkkit = { path = "../si-checkkit" }
+
+[[bin]]
+name = "modeler-checkkit"
+path = "src/bin/modeler-checkkit/main.rs"

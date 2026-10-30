@@ -1,0 +1,63 @@
+[package]
+name = "si-render"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Softimage|3D's own (native, non-mental-ray) renderer: geometry stage, BSP tree, sampling and antialiasing, the shading model, ray tracing, shadow maps, frame buffer and picture output, computed on the x87 model"
+
+[dependencies]
+si-x87 = { path = "../si-x87" }
+si-math = { path = "../si-math" }
+# the one image of the program's memory (finding 0024): the routines ported in place
+si-mem = { path = "../si-mem" }
+# the original's data tables and texts, read from the user's own install at run time (release model)
+si-rt = { path = "../si-rt" }
+# the polygon mesh in memory and the triangulator (the mesh converter of softvertex.c)
+si-model = { path = "../si-model" }
+# splines sampled into straight pieces, for a face's outline and holes (SI_face2triangle);
+# patch evaluation and subdivision (si_patch2triangle)
+si-spline = { path = "../si-spline" }
+si-types = { path = "../si-types" }
+# model files, for the corpus check
+si-hrc = { path = "../si-hrc" }
+
+# the picture reader, for texture pictures (SI_readTextureFile); in the tests also the
+# interactive picture writer, to compare run coding with
+si-picture = { path = "../si-picture" }
+# NURBS surfaces as triangles (SI_nurbs2Triangle and the evaluators below it, on the image)
+si-nurbs = { path = "../si-nurbs" }
+# the output dither (SI_fsDitherInit, SI_fsDitherScan: si-imgfmt's ports, bound in the frame
+# loop; finding 0012, section 23)
+si-imgfmt = { path = "../si-imgfmt" }
+
+# the generic check driver (toolbelt T2, finding 0011), for `matglobal-checkkit` (mat_global.c)
+si-checkkit = { path = "../si-checkkit" }
+
+[[bin]]
+name = "matglobal-checkkit"
+path = "src/bin/matglobal-checkkit/main.rs"
+
+# the volume-effect files (package 65), checked on si-checkkit (finding 0012, section 28)
+[[bin]]
+name = "volume-checkkit"
+path = "src/bin/volume-checkkit/main.rs"
+
+# the equality tests of materials and textures (package 5; finding 0023, section 30)
+[[bin]]
+name = "equal-checkkit"
+path = "src/bin/equal-checkkit/main.rs"
+
+# the parameter validators of mat_validation.c (finding 0012, section 33)
+[[bin]]
+name = "matval-checkkit"
+path = "src/bin/matval-checkkit/main.rs"
+
+# user.c's VC* wrappers over the metaball library (unit subreg1)
+[[bin]]
+name = "user-checkkit"
+path = "src/bin/user-checkkit/main.rs"
+
+# the leftovers of the texture and material code (tex_leftovers.rs; finding 0012, section 35, unit tex1)
+[[bin]]
+name = "tex1-checkkit"
+path = "src/bin/tex1-checkkit/main.rs"

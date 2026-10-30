@@ -1,0 +1,62 @@
+[package]
+name = "si-scene"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Softimage|3D scene loading and saving through the element dictionary: the sequence of Get Scene and Save Scene, the dictionary look-ups, deletion and copy, the topological sort"
+
+[dependencies]
+si-file = { path = "../si-file" }
+si-db = { path = "../si-db" }
+si-types = { path = "../si-types" }
+si-ascii = { path = "../si-ascii" }
+si-hrc = { path = "../si-hrc" }
+si-elemio = { path = "../si-elemio" }
+si-picture = { path = "../si-picture" }
+si-x87 = { path = "../si-x87" }
+si-mem = { path = "../si-mem" }
+# the ascii cluster node reader (asceneio.c) is on the image there; si-app depends on si-mem and si-x87 only (routing5)
+si-app = { path = "../si-app" }
+si-dict = { path = "../si-dict" }
+# the element readers on the image call out to the model code and the scene graph's list,
+# and the loader builds that list (finding 0018, section 16)
+si-view = { path = "../si-view" }
+si-model = { path = "../si-model" }
+si-math = { path = "../si-math" }
+# the 3D texture reader calls SI_updTxt3dTurb, which si-render has on the image
+# (finding 0018, section 17)
+si-render = { path = "../si-render" }
+# SI_scnRelationsFromElemDict makes fitting records (finding 0018, section 17)
+si-deform = { path = "../si-deform" }
+# the untold relations of the sort ask whether a joint is a break joint (finding 0018,
+# section 19): si-kine has it on the image
+si-kine = { path = "../si-kine" }
+# the expression files read into the EXPRESSIONS elements and tied to their relations
+# where the load does it (finding 0018, section 19; finding 0013, section 12)
+si-expr = { path = "../si-expr" }
+# the spline reader's SI_splineUpdateMatrix, which the model readers call for every spline
+# they read (finding 0029, third pass; finding 0018)
+si-spline = { path = "../si-spline" }
+# the material conversion copies the animation of a texture to its copy
+# (SI_texture2DLoadFcurveAll, SI_texture3DLoadFcurveAll, SI_elemdictCopyElemAnim), which
+# si-motion has on the image (finding 0018, section 23.12)
+si-motion = { path = "../si-motion" }
+# the envelope's, the shapes' and the readjusting's NURBS copies, disposals and point moves,
+# which si-nurbs has on the image (finding 0025, section 13)
+si-nurbs = { path = "../si-nurbs" }
+# SI_edExprRelGetFromFcvID (SI_elemdictSetAnimRelation ties a curve to an expression's relation)
+si-anim = { path = "../si-anim" }
+# the original's icon tables, read at run time from the user's install (docs/design/runtime-data.md)
+si-rt = { path = "../si-rt" }
+
+[[bin]]
+name = "scene-check"
+path = "src/bin/scene-check.rs"
+
+[[bin]]
+name = "scene-emucheck"
+path = "src/bin/scene-emucheck.rs"
+
+[[bin]]
+name = "dict-check"
+path = "src/bin/dict-check.rs"

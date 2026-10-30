@@ -1,0 +1,15 @@
+[package]
+name = "si-camera"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Softimage|3D sys_camera.c on the shared memory image: the camera's viewing matrix and its up-vector constraint (SI_camMat), the camera's moves and resets, the default cameras of the views (finding 0032)"
+
+[dependencies]
+# the shared memory image (finding 0024)
+si-mem = { path = "../si-mem" }
+# mathematics on values: vectors and 4 x 4 matrices, the x87 unit
+si-math = { path = "../si-math" }
+si-x87 = { path = "../si-x87" }
+# the camera record's offsets as the camera file's reader on the image has them
+si-elemio = { path = "../si-elemio" }

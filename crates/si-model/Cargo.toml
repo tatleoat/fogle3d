@@ -1,0 +1,26 @@
+[package]
+name = "si-model"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Softimage|3D models and polygon meshes in memory: the hierarchy, a model's transformation, mesh construction and upkeep (vertex stars, edges, normals, discontinuity), primitives, triangulation"
+
+[dependencies]
+si-rt = { path = "../si-rt" }
+si-types = { path = "../si-types" }
+si-mem = { path = "../si-mem" }
+si-math = { path = "../si-math" }
+si-x87 = { path = "../si-x87" }
+si-hrc = { path = "../si-hrc" }
+si-file = { path = "../si-file" }
+# the conversions to a mesh on the image: genList.c (finding 0033) and the patch's grid and
+# texture coordinates (finding 0020)
+si-gen = { path = "../si-gen" }
+si-spline = { path = "../si-spline" }
+# the graph list the patch hierarchy is added to (SI_findGlData, SI_graflistAddData)
+si-view = { path = "../si-view" }
+# the triangulation of a NURBS surface on the image, for its conversion to a mesh
+si-nurbs = { path = "../si-nurbs" }
+
+# the generic check driver for objg-checkkit (finding 0011)
+si-checkkit = { path = "../si-checkkit" }

@@ -1,0 +1,19 @@
+[package]
+name = "si-nurbs"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Softimage|3D NURBS curves and surfaces: the records, their allocation and copying, span search, evaluation with derivatives, the surface normal, knot insertion and sampling, computed on the software x87 unit"
+
+[dependencies]
+# the original's message texts, read at run time from the user's install (release model)
+si-rt = { path = "../si-rt" }
+si-x87 = { path = "../si-x87" }
+si-math = { path = "../si-math" }
+si-types = { path = "../si-types" }
+si-hrc = { path = "../si-hrc" }
+# the one image of the program's memory (finding 0024): the second form of the evaluators
+# and the conversion to the renderer's triangles (`image`, `convert`)
+si-mem = { path = "../si-mem" }
+# the generic check driver (toolbelt T2), for `nurbs-rendercheck` (finding 0044)
+si-checkkit = { path = "../si-checkkit" }

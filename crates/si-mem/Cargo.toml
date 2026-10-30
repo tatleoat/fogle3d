@@ -1,0 +1,8 @@
+[package]
+name = "si-mem"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "The one image of Softimage|3D's writable memory that every ported crate works on: .data and .bss at their original addresses, heap, test arena and stack, typed 32-bit pointers and records in place, recorded faults, the C library's allocator as the emulation harness models it, snapshots and vector-file loading for checks, a registry for function pointers and a table for handles; depends on no other crate of the workspace"
+
+[dependencies]

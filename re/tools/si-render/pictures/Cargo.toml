@@ -1,0 +1,50 @@
+# The port's pictures of the sample scenes (finding 0012, section 20). A package of its own,
+# outside the workspace: it needs si-rensetup, which depends on si-render, so it cannot be a
+# binary of si-render. Build from the repository root:
+#   CARGO_TARGET_DIR=$PWD/target/si-render cargo build --release --manifest-path re/tools/si-render/pictures/Cargo.toml
+[package]
+name = "si-render-pictures"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+si-render = { path = "../../../../crates/si-render" }
+si-rensetup = { path = "../../../../crates/si-rensetup" }
+si-scene = { path = "../../../../crates/si-scene" }
+si-db = { path = "../../../../crates/si-db" }
+si-mem = { path = "../../../../crates/si-mem" }
+# for the icon of a sub-range's first picture (picture file bytes)
+si-picture = { path = "../../../../crates/si-picture" }
+si-types = { path = "../../../../crates/si-types" }
+# si_lightInitialize, for SI_matterInit's default light
+si-elemio = { path = "../../../../crates/si-elemio" }
+# the install-path layer (release model, unit pkg1)
+si-install = { path = "../../pkg/si-install" }
+# the original's tables and messages from the user's program file, checked at start
+si-rt = { path = "../../../../crates/si-rt" }
+# for render-frames (rensetup-check's source names it)
+si-view = { path = "../../../../crates/si-view" }
+
+[[bin]]
+name = "render-pictures"
+path = "src/main.rs"
+
+# rensetup-check (si-rensetup's, copied by build.rs) with every frame of the range, or one:
+# finding 0012, section 23
+[[bin]]
+name = "render-frames"
+path = "src/frames.rs"
+
+# Speed program, step 1 (unit perf1): fat LTO and one code-generation unit, 3-7 % less CPU on
+# the corpus than the default release profile with identical pictures (re/out/perf1). No
+# target-cpu: the binary runs on any x86-64 (a CPU floor is only an option, see the finding).
+# panic stays "unwind": the corpus loop and si-mem's fault stop rely on unwinding.
+[profile.release]
+opt-level = 3
+debug = false
+lto = "fat"
+codegen-units = 1
+panic = "unwind"

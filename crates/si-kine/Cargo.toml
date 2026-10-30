@@ -1,0 +1,21 @@
+[package]
+name = "si-kine"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Softimage|3D inverse kinematics and skeletons: the chain solver (closed forms for one and two joints, the Jacobian iteration for longer planar and spatial chains), joint rotation limits, chains as objects"
+
+[dependencies]
+si-types = { path = "../si-types" }
+si-math = { path = "../si-math" }
+si-x87 = { path = "../si-x87" }
+si-model = { path = "../si-model" }
+si-hrc = { path = "../si-hrc" }
+# the shared memory image (finding 0024): what the second pass of this crate is written on
+si-mem = { path = "../si-mem" }
+# the dictionaries on the image: update lists, relations (second pass)
+si-dict = { path = "../si-dict" }
+# value functions only: a spline type's basis and the forward-difference matrix
+si-spline = { path = "../si-spline" }
+# the generic check driver (finding 0011, "A check binary with si-checkkit")
+si-checkkit = { path = "../si-checkkit" }

@@ -1,0 +1,11 @@
+# Install-path layer of the release model (unit pkg1): the one place in Rust that finds the user's own
+# Softimage|3D 4.0 install. Own workspace (outside the root one); render-frames and blend2db use it by path.
+[package]
+name = "si-install"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]

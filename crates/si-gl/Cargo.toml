@@ -1,0 +1,17 @@
+[package]
+name = "si-gl"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Softimage|3D's IRIS GL emulation layer (gl4emult): windows, events, drawing, fonts, cursors, picking, with every call that leaves the program behind a trait (its audio, audio-file, SGI image and lock libraries are not ported yet)"
+
+[features]
+# The imported symbols of libX11, libGL and libGLU as extern "C" declarations (sys/real.rs);
+# no implementation of the traits yet.
+# Off by default: nothing in the tests or checks opens a display.
+system = []
+
+[dependencies]
+si-x87 = { path = "../si-x87" }
+# the original's tables, read at run time from the user's install (unit rta)
+si-rt = { path = "../si-rt" }

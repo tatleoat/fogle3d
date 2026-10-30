@@ -1,0 +1,18 @@
+[package]
+name = "si-db"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Softimage|3D databases on disk: chapters, file names and versions, Chapter.rsrc, the database list, directory scans, database creation"
+
+[dependencies]
+si-file = { path = "../si-file" }
+# the shared memory image (finding 0024), for the browser's functions that work on records in place
+si-mem = { path = "../si-mem" }
+si-types = { path = "../si-types" }
+# the generic check driver (toolbelt T2), for `db-checkkit`
+si-checkkit = { path = "../si-checkkit" }
+
+[[bin]]
+name = "db-checkkit"
+path = "src/bin/db-checkkit/main.rs"

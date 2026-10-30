@@ -1,0 +1,22 @@
+[package]
+name = "si-elemio"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Softimage|3D binary element files other than models, materials and textures: camera, light, lattice, animation, struct keys, cluster and shape files, the program's readers and writers as values, and (src/image) the readers of camera, light, lattice, animation and struct key files on the shared memory image"
+
+[dependencies]
+si-rt = { path = "../si-rt" }
+si-file = { path = "../si-file" }
+si-picture = { path = "../si-picture" }
+si-x87 = { path = "../si-x87" }
+# the shared memory image, for the readers of `src/image` (finding 0024)
+si-mem = { path = "../si-mem" }
+
+[[bin]]
+name = "elemio-emucheck"
+path = "src/bin/elemio-emucheck/main.rs"
+
+[[bin]]
+name = "elemio-imagecheck"
+path = "src/bin/elemio-imagecheck/main.rs"

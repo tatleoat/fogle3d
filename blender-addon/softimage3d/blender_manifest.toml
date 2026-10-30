@@ -1,0 +1,17 @@
+schema_version = "1.0.0"
+id = "fogle3d"
+version = "0.1.0"
+name = "Fogle3D"
+tagline = "Unofficial renderer; needs your own Softimage 3D 4.0 copy"
+maintainer = "fogle3d"
+type = "add-on"
+blender_version_min = "4.2.0"
+license = ["SPDX:GPL-3.0-or-later"]
+platforms = ["linux-x64"]
+
+# NOTICE: Fogle3D is an unofficial, independent recompilation of a renderer. It is not affiliated with or endorsed by
+# the makers of Softimage 3D. It requires the user's own licensed copy of Softimage 3D 4.0 and ships none of its
+# assets or code.
+
+[permissions]
+files = "Reads your Softimage 3D 4.0 install; writes temp pictures"

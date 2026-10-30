@@ -1,0 +1,22 @@
+[package]
+name = "si-gen"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Softimage|3D's generic containers on the shared memory image: genList.c, the circular doubly linked list the material, texture and conversion code builds its lists with (finding 0033)"
+
+[dependencies]
+# the shared memory image (finding 0024)
+si-mem = { path = "../si-mem" }
+# the vector format of the emulation checks (finding 0011), for `gen-emucheck`
+si-x87 = { path = "../si-x87" }
+# the generic check driver (toolbelt T2, finding 0011), for `gen-checkkit`
+si-checkkit = { path = "../si-checkkit" }
+
+[[bin]]
+name = "gen-emucheck"
+path = "src/bin/gen-emucheck/main.rs"
+
+[[bin]]
+name = "gen-checkkit"
+path = "src/bin/gen-checkkit/main.rs"

@@ -1,0 +1,11 @@
+[package]
+name = "si-checkkit"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "The one generic driver of the emulation and live checks (toolbelt T2): reads a directory of vector files (finding 0011), places each case in a fresh image, calls the registered ports, compares memory, heap, frees, calls and return value, and tallies; a check binary is a table of closures and one call to `run` (finding 0011, 'A check binary with si-checkkit')"
+
+[dependencies]
+# the shared memory image (finding 0024) and the vector format (finding 0011)
+si-mem = { path = "../si-mem" }
+si-x87 = { path = "../si-x87" }

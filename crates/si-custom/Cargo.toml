@@ -1,0 +1,28 @@
+[package]
+name = "si-custom"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Softimage|3D shader database (shdb_*.c): the _SHADER_PREVIEWER text parser and scanner, the node tree, the mental ray translator and the preview setup (finding 0041)"
+
+[dependencies]
+# the shared memory image (finding 0024)
+si-mem = { path = "../si-mem" }
+# the original's data tables, read at run time from the user's install (unit rtdata1)
+si-rt = { path = "../si-rt" }
+# the x87 register model (finding 0008), for the bilinear lookup and the sums done in 80 bits
+si-x87 = { path = "../si-x87" }
+# the generic check driver (toolbelt T2, finding 0011), for `custom-checkkit`
+si-checkkit = { path = "../si-checkkit" }
+
+# matter.c's copy-from-setup routines (unit cus1), checked by custom-checkkit
+si-matter = { path = "../si-matter" }
+
+[[bin]]
+name = "custom-checkkit"
+path = "src/bin/custom-checkkit/main.rs"
+
+# the check binary of unit cusrel1 (cusStatusCreateRelations and its sscanf model), kept apart from custom-checkkit
+[[bin]]
+name = "cusrel1-check"
+path = "src/bin/cusrel1-check/main.rs"

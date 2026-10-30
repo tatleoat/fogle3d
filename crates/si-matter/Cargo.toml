@@ -1,0 +1,12 @@
+[package]
+name = "si-matter"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Softimage|3D matter.c: the copy-from-setup routines for materials and textures, and the matter start-up (unit cus1, finding 0041)"
+
+[dependencies]
+# the shared memory image (finding 0024)
+si-mem = { path = "../si-mem" }
+# the x87 register model (finding 0008), for the texture offset sums
+si-x87 = { path = "../si-x87" }

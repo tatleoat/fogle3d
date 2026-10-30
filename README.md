@@ -11,6 +11,26 @@ Blender scene with it (Render Properties > Render Engine > Fogle3D) and imports 
 (File > Import > Softimage 3D scene (.dsc)). The renderer is a separate program the add-on starts, so it also runs
 on its own from the command line.
 
+## Pictures
+
+Both pictures were rendered by Fogle3D from Blender scenes built from scratch for this page (our own geometry and
+generated textures; nothing from Softimage 3D's sample content). Settings and times are as measured on a 22-core Linux
+machine, 1920x1280 render, shown here at 1600 px.
+
+![Glass and metal still life](docs/images/still-life-glass-metal.jpg)
+
+*Glass and metal still life: a wine glass and a ball in refracting glass, a chrome ball, two painted balls, on a
+generated checker floor in a room. Ray traced reflection and refraction (depth 8), hard ray traced shadows from the
+lights (the area light is rendered as a spot, so no soft shadows), no anti-aliasing settings changed. Fogle3D 2.5 s;
+the same scene in Blender Cycles, CPU, 128 samples, no denoising, took 86.6 s and shows soft shadows and glossy
+highlights that Fogle3D does not.*
+
+![NURBS vase and wine glass](docs/images/nurbs-vase-glass.jpg)
+
+*NURBS surfaces: a vase and a wine glass (surfaces of revolution, cubic NURBS), a torus and a sphere patch, with ray
+traced shadows. Fogle3D 5.8 s at 1920x1280; Blender Cycles, CPU, 128 samples, no denoising, 19.4 s. Fogle3D's
+picture is flatter: no soft shadows and no glossy highlights beyond a simple specular.*
+
 ## What is here
 
 | Path | What it is |
